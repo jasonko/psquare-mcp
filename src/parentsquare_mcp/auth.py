@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -287,15 +288,16 @@ def is_session_valid(session: requests.Session) -> bool:
     """Check whether the session is authenticated.
 
     ParentSquare returns 200 on the root page even without auth, so we can't
-    rely on a /signin redirect. Instead, check for gon.user_id in the page
-    which is only present for authenticated users.
+    rely on a /signin redirect. Instead, check for a numeric gon.user_id in the
+    page. Unauthenticated pages render ``gon.user_id=null``, so a mere substring
+    check for ``gon.user_id`` is not sufficient — the value must be an integer.
     """
     resp = session.get(f"{BASE_URL}/", allow_redirects=True)
     if "/signin" in resp.url:
         return False
     if resp.status_code != 200:
         return False
-    return "gon.user_id" in resp.text
+    return re.search(r"gon\.user_id\s*=\s*\d+", resp.text) is not None
 
 
 def ensure_session(session: requests.Session, email: str, password: str) -> None:
