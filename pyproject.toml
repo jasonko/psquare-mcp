@@ -37,6 +37,9 @@ dependencies = [
 [project.optional-dependencies]
 pdf = ["pymupdf>=1.27.0"]
 
+[dependency-groups]
+dev = ["pytest>=8.0.0"]
+
 [project.urls]
 Homepage = "https://github.com/thehesiod/psquare-mcp"
 Repository = "https://github.com/thehesiod/psquare-mcp"

@@ -7,7 +7,7 @@ MCP server that scrapes ParentSquare's web UI. Runs as stdio transport. While th
 ```
 server.py          — MCP tool definitions, inline image/PDF fetching
 client.py          — HTTP client with auto-relogin on session expiry
-auth.py            — Cookie persistence (~/.parentsquare_cookies.json), credential loading (env vars → 1Password), MFA flow
+auth.py            — Cookie persistence (~/.parentsquare_cookies.json), credential loading (env vars → 1Password/LastPass), MFA flow
 config.py          — URL templates and constants (no personal data — auto-discovered at runtime)
 models.py          — Dataclasses for all parsed entities
 download.py        — File download with conflict handling
@@ -19,7 +19,9 @@ export_cookies.py  — CLI helper to bootstrap cookies from browser DevTools
 
 ### Authentication
 - Cookies are lazy-loaded from `~/.parentsquare_cookies.json` on startup (no network call)
-- On session expiry (detected by redirect to `/signin` **or** missing `gon.user_id` on the root page), credentials are loaded via `load_credentials()`: first from `PS_USERNAME`/`PS_PASSWORD` env vars, then falling back to 1Password CLI (`op item get Parentsquare` — item must be named "Parentsquare" with fields labeled `username` and `password`)
+- On session expiry (detected by redirect to `/signin` **or** missing `gon.user_id` on the root page), credentials are loaded via `load_credentials()`: first from `PS_USERNAME`/`PS_PASSWORD` env vars, then from the provider named by `PS_CREDENTIAL_PROVIDER` (default `1password`). Options:
+  - `1password` — `op item get Parentsquare` (item named "Parentsquare" with fields labeled `username` and `password`)
+  - `lastpass` — `lpass show --json <item>` where the item defaults to `parentsquare.com` and is overridable with `PS_LASTPASS_ITEM` (exact name or entry ID). Requires a prior `lpass login <email>`; `lpass status --quiet` is checked first (short timeout) so requests never hang on an interactive prompt. Credential values are never logged or included in error messages.
 - **Important**: ParentSquare's root page (`/`) returns HTTP 200 even for unauthenticated users, so `/signin` redirect alone is not sufficient to detect expired sessions. `discover_account()` and `is_session_valid()` also check for `gon.user_id` in the page content.
 - MFA code submission verifies the session is actually authenticated after the code is accepted
 - MFA state persists to disk (`.parentsquare_mfa_state.json`) so it survives server restarts
@@ -73,6 +75,7 @@ ParentSquare renders both a truncated and expanded (full) version of each post's
 ```bash
 uv run parentsquare-mcp              # Run the MCP server
 uv run parentsquare-export-cookies   # Bootstrap cookies from browser
+uv run --group dev pytest            # Run the unit tests
 ```
 
 ### Adding a New Parser

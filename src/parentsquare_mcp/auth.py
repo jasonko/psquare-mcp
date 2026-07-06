@@ -90,6 +90,77 @@ def load_credentials_from_env() -> tuple[str, str] | None:
     return None
 
 
+def load_credentials_from_lastpass() -> tuple[str, str]:
+    """Load ParentSquare credentials from the LastPass CLI (``lpass``).
+
+    Requires the user to have run ``lpass login <email>`` in a terminal
+    beforehand. The item to read is controlled by ``PS_LASTPASS_ITEM``
+    (default ``parentsquare.com``) and may be an exact entry name or an entry ID.
+
+    Credential values are never included in log output or error messages.
+    """
+    item = os.environ.get("PS_LASTPASS_ITEM", "parentsquare.com")
+
+    # Fast, non-interactive login-state check. A short timeout prevents an
+    # MCP request from hanging if lpass would otherwise block on a prompt.
+    try:
+        status = subprocess.run(
+            ["lpass", "status", "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "LastPass CLI (lpass) not found. Install it (e.g. `brew install lastpass-cli`) "
+            "or set PS_CREDENTIAL_PROVIDER to another provider."
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("Timed out running `lpass status`. Is the LastPass agent responsive?") from e
+
+    if status.returncode != 0:
+        raise RuntimeError(
+            "Not logged in to LastPass. Run `lpass login <your-lastpass-email>` in a terminal "
+            "before starting the server (this may prompt for MFA)."
+        )
+
+    try:
+        result = subprocess.run(
+            ["lpass", "show", "--json", "--sync=auto", item],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"Timed out reading '{item}' from LastPass.") from e
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to read '{item}' from LastPass. Check that the item exists and PS_LASTPASS_ITEM is correct."
+        )
+
+    try:
+        entries = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Could not parse LastPass response for '{item}'.") from e
+
+    if not isinstance(entries, list) or len(entries) == 0:
+        raise RuntimeError(f"No LastPass entry named '{item}' was found.")
+    if len(entries) > 1:
+        raise RuntimeError(
+            f"Multiple LastPass entries match '{item}'. Set PS_LASTPASS_ITEM to a unique name or entry ID."
+        )
+
+    entry = entries[0]
+    username = entry.get("username") or ""
+    password = entry.get("password") or ""
+    if not username or not password:
+        raise RuntimeError(f"LastPass entry '{item}' is missing a username or password field.")
+
+    logger.info("Loaded credentials from LastPass")
+    return username, password
+
+
 def load_credentials_from_1password() -> tuple[str, str]:
     """Load ParentSquare credentials from 1Password via CLI."""
     result = subprocess.run(
@@ -111,10 +182,24 @@ def load_credentials_from_1password() -> tuple[str, str]:
 
 
 def load_credentials() -> tuple[str, str]:
-    """Load credentials from env vars, falling back to 1Password."""
+    """Load credentials from env vars, then the configured credential provider.
+
+    Order:
+      1. A complete PS_USERNAME / PS_PASSWORD pair (highest priority).
+      2. The provider named by PS_CREDENTIAL_PROVIDER: ``lastpass`` or
+         ``1password`` (default ``1password`` for backward compatibility).
+    """
     if creds := load_credentials_from_env():
         return creds
-    return load_credentials_from_1password()
+
+    provider = os.environ.get("PS_CREDENTIAL_PROVIDER", "1password").strip().lower()
+    if provider == "lastpass":
+        return load_credentials_from_lastpass()
+    if provider == "1password":
+        return load_credentials_from_1password()
+    raise RuntimeError(
+        f"Unknown PS_CREDENTIAL_PROVIDER '{provider}'. Expected 'lastpass' or '1password'."
+    )
 
 
 def save_cookies(session: requests.Session) -> None:

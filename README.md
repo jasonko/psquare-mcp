@@ -58,7 +58,7 @@ Available on the [MCP Registry](https://registry.modelcontextprotocol.io) as `io
 - **`submit_mfa_code`** — Complete MFA verification with a 6-digit code
 - Supports MCP elicitation for inline MFA prompts
 - Session cookies persisted to `~/.parentsquare_cookies.json`
-- Credentials loaded from environment variables or 1Password CLI on session expiry
+- Credentials loaded from environment variables, 1Password, or LastPass CLI on session expiry
 
 ## Setup
 
@@ -67,7 +67,9 @@ Available on the [MCP Registry](https://registry.modelcontextprotocol.io) as `io
 Credentials can be provided in either of two ways (checked in this order):
 
 1. **Environment variables** — set `PS_USERNAME` and `PS_PASSWORD`
-2. **[1Password CLI](https://developer.1password.com/docs/cli/)** (`op`) — with a "Parentsquare" item containing `username` and `password` fields
+2. **A credential manager** selected by `PS_CREDENTIAL_PROVIDER` (default `1password`):
+   - **[1Password CLI](https://developer.1password.com/docs/cli/)** (`op`) — with a "Parentsquare" item containing `username` and `password` fields
+   - **[LastPass CLI](https://github.com/LastPass/lastpass-cli)** (`lpass`) — set `PS_CREDENTIAL_PROVIDER=lastpass`. Run `lpass login <your-lastpass-email>` in a terminal first (may prompt for MFA). The item read defaults to `parentsquare.com` and can be overridden with `PS_LASTPASS_ITEM` (an exact entry name or entry ID).
 
 ### Install in Claude Code
 
@@ -102,7 +104,26 @@ To use environment variables with Claude Code, add an `env` block to your MCP co
 }
 ```
 
-> **Security note:** environment variables place your password in plaintext inside your MCP config file. If you chose a password manager specifically to avoid that, prefer the 1Password CLI path.
+> **Security note:** environment variables place your password in plaintext inside your MCP config file. If you chose a password manager specifically to avoid that, prefer the 1Password or LastPass CLI path.
+
+To use the LastPass CLI instead of 1Password, log in once (`lpass login <your-lastpass-email>`) and set the provider in your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "parentsquare": {
+      "command": "uvx",
+      "args": ["parentsquare-mcp"],
+      "env": {
+        "PS_CREDENTIAL_PROVIDER": "lastpass",
+        "PS_LASTPASS_ITEM": "parentsquare.com"
+      }
+    }
+  }
+}
+```
+
+`PS_LASTPASS_ITEM` is optional (defaults to `parentsquare.com`).
 
 ## How It Works
 
