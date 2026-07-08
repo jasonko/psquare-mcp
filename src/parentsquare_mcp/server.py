@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 import os
 import re
@@ -17,9 +19,25 @@ from mcp.shared.exceptions import McpError
 from pydantic import BaseModel, Field
 
 from parentsquare_mcp.auth import MFARequiredError, MFAState, load_cookies, submit_mfa
+from parentsquare_mcp.audit import WRITES_DISABLED_MESSAGE, audit_write, writes_enabled
 from parentsquare_mcp.client import PSClient
 from parentsquare_mcp.config import DEFAULT_DOWNLOAD_DIR, URLS
 from parentsquare_mcp.download import download_file as do_download
+from parentsquare_mcp.parsers.admin import (
+    STUDENT_PROFILE_QUERY,
+    build_add_parent_body,
+    build_add_student_body,
+    build_edit_parent_body,
+    build_edit_student_body,
+    build_link_guardian_body,
+    extract_parent_edit_fields,
+    extract_student_edit_fields,
+    parse_grades,
+    parse_roster_parents,
+    parse_roster_students,
+    parse_student_profile,
+    write_succeeded,
+)
 from parentsquare_mcp.parsers.calendar import parse_ics_calendar
 
 from parentsquare_mcp.parsers.feeds import parse_feed_page, parse_post_detail
@@ -1133,6 +1151,449 @@ async def list_forms(school_id: int, context: Context[Any, Any] = None) -> str:
             lines.append(f"  {p.summary}")
         lines.append("")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Admin tools (roster: students & guardians)
+#
+# Read tools (list_students, list_grades, get_student) are always available.
+# Write tools (add_/edit_student, add_/edit_parent, link_guardian_to_student)
+# are gated behind PS_ENABLE_WRITES and audited. v1 is create/edit only — no
+# destructive operations. See the vault note "ParentSquare admin API mapping".
+# ---------------------------------------------------------------------------
+
+
+def _roster_students(client: PSClient, school_id: int):
+    """Fetch and parse the full admin student roster (one call, client paginates)."""
+    data = client.get_json(f"/schools/{school_id}/roster/students_data?_=1")
+    return parse_roster_students(data.get("data", []))
+
+
+def _roster_parents(client: PSClient, school_id: int):
+    """Fetch and parse the full admin parent/guardian roster (one call)."""
+    data = client.get_json(f"/schools/{school_id}/roster/parents_data?_=1")
+    return parse_roster_parents(data.get("data", []))
+
+
+def _student_grade_id(client: PSClient, school_id: int, student_id: int) -> str:
+    """Resolve a student's current grade_id from its edit form (for kid links)."""
+    js = client.get_text(f"/schools/{school_id}/students/{student_id}/edit")
+    return extract_student_edit_fields(js).get("grade_id", "")
+
+
+def _write_result(tool: str, args: dict, resp) -> str:
+    """Interpret a form-write Response, audit it, and format a user message."""
+    ok = write_succeeded(resp.status_code, resp.headers.get("content-type", ""), resp.text)
+    audit_write(tool, args, ok, detail=f"HTTP {resp.status_code}")
+    if ok:
+        return "✅ Success."
+    snippet = " ".join(resp.text.split())[:200]
+    return f"❌ Operation failed (HTTP {resp.status_code}). ParentSquare response: {snippet}"
+
+
+def _write_gated(func):
+    """Gate a write tool behind ``PS_ENABLE_WRITES``.
+
+    When writes are disabled, the blocked attempt is audited and the friendly
+    disabled message is returned without invoking the tool. ``functools.wraps``
+    preserves the wrapped function's signature so FastMCP still builds the
+    correct tool schema (it introspects via ``inspect.signature``, which follows
+    ``__wrapped__``).
+    """
+    sig = inspect.signature(func)
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        if not writes_enabled():
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            audit_args = {k: v for k, v in bound.arguments.items() if k != "context"}
+            audit_write(func.__name__, audit_args, False, detail="blocked: writes disabled")
+            return WRITES_DISABLED_MESSAGE
+        return await func(*args, **kwargs)
+
+    return wrapper
+
+
+@mcp.tool(name="list_students")
+async def list_students(
+    school_id: int,
+    grade: str | None = None,
+    name_contains: str | None = None,
+    context: Context[Any, Any] = None,
+) -> dict | str:
+    """List students on a school's admin roster (id, name, grade, SIS id, guardians).
+
+    Returns the full roster in one call. Use the `id` from results as `student_id`
+    in get_student, edit_student, add_parent, and link_guardian_to_student.
+
+    Args:
+        school_id: School ID (from list_schools)
+        grade: Optional case-insensitive filter on grade name (e.g. "2nd Grade")
+        name_contains: Optional case-insensitive substring filter on student name
+    """
+    app = _app(context)
+    students, err = await _with_mfa_retry(app, context, lambda: _roster_students(app.client, school_id))
+    if err:
+        return err
+    if grade:
+        g = grade.lower()
+        students = [s for s in students if g in s.grade.lower()]
+    if name_contains:
+        n = name_contains.lower()
+        students = [s for s in students if n in s.name.lower()]
+    return {
+        "school": _school_name(app, school_id),
+        "count": len(students),
+        "students": [
+            {
+                "student_id": s.id,
+                "name": s.name,
+                "grade": s.grade,
+                "student_sis_id": s.student_sis_id,
+                "guardians": s.parents,
+            }
+            for s in students
+        ],
+    }
+
+
+@mcp.tool(name="list_parents")
+async def list_parents(
+    school_id: int,
+    name_contains: str | None = None,
+    student_name_contains: str | None = None,
+    context: Context[Any, Any] = None,
+) -> dict | str:
+    """List guardians/parents on a school's admin roster (user_id, name, email, phone, linked students).
+
+    Returns the full parent roster in one call. Use the `user_id` from results in
+    edit_parent and link_guardian_to_student.
+
+    Args:
+        school_id: School ID (from list_schools)
+        name_contains: Optional case-insensitive substring filter on guardian name
+        student_name_contains: Optional case-insensitive substring filter on the
+            guardian's linked student names
+    """
+    app = _app(context)
+    parents, err = await _with_mfa_retry(app, context, lambda: _roster_parents(app.client, school_id))
+    if err:
+        return err
+    if name_contains:
+        n = name_contains.lower()
+        parents = [p for p in parents if n in p.name.lower()]
+    if student_name_contains:
+        s = student_name_contains.lower()
+        parents = [p for p in parents if s in p.students.lower()]
+    return {
+        "school": _school_name(app, school_id),
+        "count": len(parents),
+        "parents": [
+            {
+                "user_id": p.user_id,
+                "name": p.name,
+                "email": p.email,
+                "phone": p.phone,
+                "students": p.students,
+                "registered": p.registered,
+            }
+            for p in parents
+        ],
+    }
+
+
+@mcp.tool(name="list_grades")
+async def list_grades(school_id: int, context: Context[Any, Any] = None) -> dict | str:
+    """List a school's grades with their grade_id values (needed for add_student).
+
+    Grades are per-school and discovered at runtime. Use the returned `grade_id`
+    with add_student / edit_student.
+
+    Args:
+        school_id: School ID (from list_schools)
+    """
+    app = _app(context)
+    soup, err = await _with_mfa_retry(
+        app, context, lambda: app.client.get_page(f"/schools/{school_id}/roster/add_remove_students")
+    )
+    if err:
+        return err
+    grades = parse_grades(soup)
+    return {
+        "school": _school_name(app, school_id),
+        "grades": [{"grade_id": g.id, "name": g.name} for g in grades],
+    }
+
+
+@mcp.tool(name="get_student")
+async def get_student(student_id: int, context: Context[Any, Any] = None) -> dict | str:
+    """Get admin detail for one student (name, grade, SIS id, linked guardians, classes).
+
+    Args:
+        student_id: Student ID (the `id` from list_students; == roster id)
+    """
+    app = _app(context)
+
+    def _fetch():
+        return app.client.graphql(STUDENT_PROFILE_QUERY, {"studentId": student_id}, "StudentProfileView")
+
+    data, err = await _with_mfa_retry(app, context, _fetch)
+    if err:
+        return err
+    profile = parse_student_profile(data)
+    if not profile:
+        return f"No student found with id {student_id}."
+    return {
+        "student_id": profile.student_id,
+        "name": profile.full_name,
+        "first_name": profile.first_name,
+        "last_name": profile.last_name,
+        "school": profile.school_name,
+        "school_id": profile.school_id,
+        "grade": profile.grade_name,
+        "student_sis_id": profile.student_sis_id,
+        "guardians": profile.parents,
+        "classes": profile.sections,
+    }
+
+
+@mcp.tool(name="add_student")
+@_write_gated
+async def add_student(
+    school_id: int,
+    first_name: str,
+    last_name: str,
+    grade_id: int,
+    student_sis_id: str | None = None,
+    context: Context[Any, Any] = None,
+) -> str:
+    """Create a new student on a school's roster. Requires PS_ENABLE_WRITES.
+
+    Use list_grades(school_id) to find the grade_id. The new student's id is not
+    returned by ParentSquare — call list_students afterward to retrieve it.
+
+    Args:
+        school_id: School ID
+        first_name: Student first name
+        last_name: Student last name
+        grade_id: Grade ID (from list_grades)
+        student_sis_id: Optional SIS/external student ID
+    """
+    app = _app(context)
+    args = {"school_id": school_id, "first_name": first_name, "last_name": last_name,
+            "grade_id": grade_id, "student_sis_id": student_sis_id}
+    body = build_add_student_body(first_name, last_name, grade_id, student_sis_id or "")
+    resp, err = await _with_mfa_retry(
+        app, context, lambda: app.client.post_form(f"/schools/{school_id}/students", body)
+    )
+    if err:
+        return err
+    return _write_result("add_student", args, resp)
+
+
+@mcp.tool(name="edit_student")
+@_write_gated
+async def edit_student(
+    school_id: int,
+    student_id: int,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    student_sis_id: str | None = None,
+    grade_id: int | None = None,
+    context: Context[Any, Any] = None,
+) -> str:
+    """Update an existing student. Only provided fields change. Requires PS_ENABLE_WRITES.
+
+    Current values (name, SIS id, grade, classes) are read from the edit form and
+    preserved for any field you don't pass.
+
+    Args:
+        school_id: School ID
+        student_id: Student ID (from list_students)
+        first_name: New first name (optional)
+        last_name: New last name (optional)
+        student_sis_id: New SIS/external ID (optional)
+        grade_id: New grade ID (optional; from list_grades)
+    """
+    app = _app(context)
+    args = {"school_id": school_id, "student_id": student_id, "first_name": first_name,
+            "last_name": last_name, "student_sis_id": student_sis_id, "grade_id": grade_id}
+
+    def _load():
+        return extract_student_edit_fields(
+            app.client.get_text(f"/schools/{school_id}/students/{student_id}/edit")
+        )
+
+    current, err = await _with_mfa_retry(app, context, _load)
+    if err:
+        return err
+    if not current.get("first_name") and not current.get("last_name"):
+        return f"❌ Could not load student {student_id} (not found or no edit access)."
+    resolved_grade_id = str(grade_id) if grade_id is not None else current.get("grade_id", "")
+    if not resolved_grade_id:
+        return (
+            f"❌ Could not determine the current grade for student {student_id}; "
+            "refusing the edit to avoid blanking it. Pass an explicit grade_id "
+            "(see list_grades)."
+        )
+
+    body = build_edit_student_body(
+        first_name=first_name if first_name is not None else current["first_name"],
+        last_name=last_name if last_name is not None else current["last_name"],
+        grade_id=resolved_grade_id,
+        sis_id=student_sis_id if student_sis_id is not None else current["external_id"],
+        section_ids=current.get("section_ids") or [],
+    )
+    resp, err = await _with_mfa_retry(
+        app, context, lambda: app.client.post_form(f"/schools/{school_id}/students/{student_id}", body)
+    )
+    if err:
+        return err
+    return _write_result("edit_student", args, resp)
+
+
+@mcp.tool(name="add_parent")
+@_write_gated
+async def add_parent(
+    school_id: int,
+    student_id: int,
+    first_name: str,
+    last_name: str,
+    email: str | None = None,
+    phone: str | None = None,
+    context: Context[Any, Any] = None,
+) -> str:
+    """Create a guardian/parent and link them to a student. Requires PS_ENABLE_WRITES.
+
+    A parent is always created attached to at least one student. The new user id
+    is not returned — call list_students or the parent roster afterward.
+
+    Args:
+        school_id: School ID
+        student_id: Student ID to attach the guardian to (from list_students)
+        first_name: Guardian first name
+        last_name: Guardian last name
+        email: Guardian email (optional)
+        phone: Guardian phone (optional)
+    """
+    app = _app(context)
+    args = {"school_id": school_id, "student_id": student_id, "first_name": first_name,
+            "last_name": last_name, "email": email, "phone": phone}
+
+    grade_id, err = await _with_mfa_retry(
+        app, context, lambda: _student_grade_id(app.client, school_id, student_id)
+    )
+    if err:
+        return err
+    if not grade_id:
+        return f"❌ Could not resolve grade for student {student_id} (not found?)."
+    body = build_add_parent_body(
+        school_id, student_id, int(grade_id), first_name, last_name, email or "", phone or ""
+    )
+    resp, err = await _with_mfa_retry(
+        app, context, lambda: app.client.post_form(f"/schools/{school_id}/users", body)
+    )
+    if err:
+        return err
+    return _write_result("add_parent", args, resp)
+
+
+@mcp.tool(name="edit_parent")
+@_write_gated
+async def edit_parent(
+    school_id: int,
+    user_id: int,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    email: str | None = None,
+    phone: str | None = None,
+    context: Context[Any, Any] = None,
+) -> str:
+    """Update a guardian's name, email, or phone. Requires PS_ENABLE_WRITES.
+
+    Only provided fields change; existing student links are preserved. Get the
+    user_id from list_parents(school_id).
+
+    Args:
+        school_id: School ID
+        user_id: Guardian's user ID (from list_parents)
+        first_name: New first name (optional)
+        last_name: New last name (optional)
+        email: New email (optional)
+        phone: New phone (optional)
+    """
+    app = _app(context)
+    args = {"school_id": school_id, "user_id": user_id, "first_name": first_name,
+            "last_name": last_name, "email": email, "phone": phone}
+
+    def _load():
+        return extract_parent_edit_fields(
+            app.client.get_text(
+                f"/schools/{school_id}/users/{user_id}/edit_institute_user", params={"role": "PARENT"}
+            )
+        )
+
+    current, err = await _with_mfa_retry(app, context, _load)
+    if err:
+        return err
+    if not current.get("first_name") and not current.get("last_name"):
+        return f"❌ Could not load guardian {user_id} (not found or no edit access)."
+    if (email is not None or phone is not None) and not current.get("contact_id"):
+        return f"❌ Could not resolve contact record for guardian {user_id}; cannot update email/phone."
+
+    body = build_edit_parent_body(
+        first_name=first_name if first_name is not None else current["first_name"],
+        last_name=last_name if last_name is not None else current["last_name"],
+        contact_id=current.get("contact_id", ""),
+        email=email,
+        phone=phone,
+    )
+    resp, err = await _with_mfa_retry(
+        app, context,
+        lambda: app.client.post_form(f"/schools/{school_id}/users/{user_id}/update_institute_user", body),
+    )
+    if err:
+        return err
+    return _write_result("edit_parent", args, resp)
+
+
+@mcp.tool(name="link_guardian_to_student")
+@_write_gated
+async def link_guardian_to_student(
+    school_id: int,
+    user_id: int,
+    student_id: int,
+    context: Context[Any, Any] = None,
+) -> str:
+    """Link an existing guardian to an additional student. Requires PS_ENABLE_WRITES.
+
+    Existing guardian-student links are left untouched. (Unlinking is a
+    destructive op deferred to the ParentSquare website in v1.)
+
+    Args:
+        school_id: School ID
+        user_id: Guardian's user ID (from list_parents)
+        student_id: Student ID to link (from list_students)
+    """
+    app = _app(context)
+    args = {"school_id": school_id, "user_id": user_id, "student_id": student_id}
+
+    grade_id, err = await _with_mfa_retry(
+        app, context, lambda: _student_grade_id(app.client, school_id, student_id)
+    )
+    if err:
+        return err
+    if not grade_id:
+        return f"❌ Could not resolve grade for student {student_id} (not found?)."
+    body = build_link_guardian_body(school_id, student_id, int(grade_id))
+    resp, err = await _with_mfa_retry(
+        app, context,
+        lambda: app.client.post_form(f"/schools/{school_id}/users/{user_id}/update_institute_user", body),
+    )
+    if err:
+        return err
+    return _write_result("link_guardian_to_student", args, resp)
 
 
 # ---------------------------------------------------------------------------

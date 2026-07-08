@@ -116,6 +116,47 @@ class PSClient:
         self._save_cookies_if_changed()
         return resp.json()
 
+    def post_form(self, path: str, data: dict) -> requests.Response:
+        """POST an application/x-www-form-urlencoded body (Rails admin write form).
+
+        Injects ``utf8=✓`` and ``authenticity_token`` and sends the CSRF token as
+        a header — matching ParentSquare's admin roster forms. Returns the raw
+        Response (these endpoints reply with a ``text/javascript`` UJS script, not
+        JSON). Does NOT raise on 4xx/5xx so callers can inspect the body; use the
+        status code and body to detect success.
+        """
+        csrf_token = self._get_csrf_token()
+        body = {"utf8": "\u2713", "authenticity_token": csrf_token, **data}
+        resp = self.session.post(
+            f"{BASE_URL}{path}",
+            data=body,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Accept": "*/*;q=0.5, text/javascript, application/javascript, "
+                "application/ecmascript, application/x-ecmascript",
+                "X-CSRF-Token": csrf_token,
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": BASE_URL,
+            },
+        )
+        self._save_cookies_if_changed()
+        return resp
+
+    def get_text(self, path: str, params: dict | None = None) -> str:
+        """GET a path and return the raw response text (e.g. an edit-form JS body).
+
+        Automatically re-authenticates if redirected to /signin.
+        """
+        url = f"{BASE_URL}{path}"
+        headers = {"Accept": "text/javascript", "X-Requested-With": "XMLHttpRequest"}
+        resp = self.session.get(url, params=params, headers=headers)
+        if "/signin" in resp.url:
+            self._relogin()
+            resp = self.session.get(url, params=params, headers=headers)
+        resp.raise_for_status()
+        self._save_cookies_if_changed()
+        return resp.text
+
     def get_json(self, path: str) -> dict:
         """GET a JSON API endpoint and return parsed response.
 

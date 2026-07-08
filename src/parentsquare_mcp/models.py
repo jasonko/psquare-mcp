@@ -195,3 +195,49 @@ class StudentDashboard:
     grade: str | None = None
     teachers: list[str] = field(default_factory=list)
     classes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Grade:
+    id: int
+    name: str
+
+
+@dataclass
+class RosterStudent:
+    """A row from the admin roster feed (`/roster/students_data`)."""
+
+    id: int                       # student record id (== GraphQL studentId)
+    name: str                     # "Last, First"
+    grade: str = ""
+    student_sis_id: str | None = None   # external/SIS id
+    parents: str = ""             # comma-joined guardian display names
+    grade_position: int | None = None
+
+
+@dataclass
+class RosterParent:
+    """A row from the admin parent roster feed (`/roster/parents_data`)."""
+
+    user_id: int
+    name: str                     # "Last, First"
+    students: str = ""            # linked kids, "Full Name (Grade)" comma-joined
+    email: str | None = None
+    phone: str | None = None
+    registered: bool = False
+
+
+@dataclass
+class AdminStudentProfile:
+    """Admin student detail from the StudentProfileView GraphQL query."""
+
+    student_id: int
+    full_name: str
+    first_name: str = ""
+    last_name: str = ""
+    school_id: int = 0
+    school_name: str = ""
+    grade_name: str = ""
+    student_sis_id: str | None = None   # externalId
+    parents: list[dict] = field(default_factory=list)   # {name, profile_path}
+    sections: list[dict] = field(default_factory=list)   # {name, period, room, teachers}

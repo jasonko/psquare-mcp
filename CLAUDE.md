@@ -8,10 +8,11 @@ MCP server that scrapes ParentSquare's web UI. Runs as stdio transport. While th
 server.py          — MCP tool definitions, inline image/PDF fetching
 client.py          — HTTP client with auto-relogin on session expiry
 auth.py            — Cookie persistence (~/.parentsquare_cookies.json), credential loading (env vars → 1Password/LastPass), MFA flow
+audit.py           — Write-gate (PS_ENABLE_WRITES) + JSONL audit log for admin write tools
 config.py          — URL templates and constants (no personal data — auto-discovered at runtime)
 models.py          — Dataclasses for all parsed entities
 download.py        — File download with conflict handling
-parsers/           — One module per page type (feeds, calendar, media, messages, etc.)
+parsers/           — One module per page type (feeds, calendar, media, messages, etc.); parsers/admin.py holds roster/edit-form parsing + write-body builders
 export_cookies.py  — CLI helper to bootstrap cookies from browser DevTools
 ```
 
@@ -58,6 +59,21 @@ ParentSquare has an internal JSON:API (not publicly documented). Discovered by i
 - `get_post`: images downloaded as MCP `Image` objects (5 MB per image, 10 MB total cap), PDFs text-extracted via pymupdf
 - `get_staff_member`: profile photo returned as inline `Image`
 - This lets Claude "see" attached calendars, flyers, staff photos etc. without extra tool calls
+
+### Admin write tools (roster: students & guardians)
+Reverse-engineered from the admin roster UI and verified live (endpoints/bodies documented in Jason's vault note "ParentSquare admin API mapping"). v1 scope is **create/edit only** — no destructive ops (delete/unlink are deferred to the website).
+
+- **Write gate:** every write tool checks `writes_enabled()` (env `PS_ENABLE_WRITES`, default off) and returns a friendly message if disabled. Reads (`list_students`, `list_parents`, `list_grades`, `get_student`) are ungated.
+- **Audit:** `audit_write(tool, args, ok, detail)` appends JSONL to `PS_AUDIT_LOG` (default `~/.parentsquare_audit.log`) for every attempt, including blocked ones.
+- **Writes are `application/x-www-form-urlencoded` Rails posts**, not JSON — use `PSClient.post_form(path, data)` (auto-injects `utf8=✓` + `authenticity_token`, sends `X-CSRF-Token`). It does **not** raise on 4xx/5xx; interpret the result with `write_succeeded()` (**success = HTTP 200 + `text/javascript` body containing a reload script**; failures return an HTML error page, e.g. 404).
+- **No created id is returned** — after add_student/add_parent, re-query `list_students` / the roster to get the new id.
+- **Rails method-override:** edit uses a POST with `_method=patch`.
+- **Endpoints:** add_student `POST /schools/{id}/students`; edit_student `POST /schools/{id}/students/{sid}` (`_method=patch`); add_parent `POST /schools/{id}/users`; edit_parent + link_guardian `POST /schools/{id}/users/{uid}/update_institute_user` (`_method=patch`).
+- **Roster feeds** (positional-array JSON, whole roster in one call, client-side paging): `GET /schools/{id}/roster/students_data` (14 cols, surfaced by `list_students`) and `.../parents_data` (12 cols, surfaced by `list_parents` — the only tool that exposes a guardian `user_id`) — parsed in `parsers/admin.py`.
+- **Edit forms** (`.../{sid}/edit`, `.../{uid}/edit_institute_user?role=PARENT`) return JS-escaped HTML; `parsers/admin.py` extracts current field values (and the parent's shared `contact_id`) so edits preserve unchanged fields. `PSClient.get_text()` fetches these.
+- **Guardian links (nested attrs):** omitting `kids_attributes` on a parent PATCH leaves existing links untouched (verified) — so `edit_parent` sends none and `link_guardian_to_student` sends only the new kid under a unique numeric key. `edit_parent` email/phone are **one** contact record addressed at indices `[0]`(email)/`[2]`(phone) with the same `contact_id`.
+- **grade_id** is per-school (from `list_grades` / the roster add-modal `<select name="student[grade_id]">`). add_parent/link resolve the kid's grade_id from its edit form.
+
 
 ## Known Gotchas
 

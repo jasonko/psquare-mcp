@@ -54,6 +54,18 @@ Available on the [MCP Registry](https://registry.modelcontextprotocol.io) as `io
 ### Student
 - **`get_student_dashboard`** — School, grade, classes, and teachers as structured JSON
 
+### Admin (roster: students & guardians)
+Read tools are always available; **write tools are disabled by default** and only run when `PS_ENABLE_WRITES` is set (see below). Every write is recorded to a local audit log. v1 is create/edit only — no destructive operations.
+- **`list_students`** — School roster (id, name, grade, SIS id, guardians) as structured JSON, with optional `grade` / `name_contains` filters
+- **`list_parents`** — Guardian roster (user_id, name, email, phone, linked students) as structured JSON, with optional `name_contains` / `student_name_contains` filters; provides the `user_id` needed by `edit_parent` / `link_guardian_to_student`
+- **`list_grades`** — A school's grades and their `grade_id` values (needed for add/edit)
+- **`get_student`** — Admin detail for one student (name, grade, SIS id, linked guardians, classes)
+- **`add_student`** *(write)* — Create a student in a grade
+- **`edit_student`** *(write)* — Update a student's name, SIS id, or grade (unchanged fields preserved)
+- **`add_parent`** *(write)* — Create a guardian linked to a student
+- **`edit_parent`** *(write)* — Update a guardian's name, email, or phone (existing links preserved)
+- **`link_guardian_to_student`** *(write)* — Link an existing guardian to an additional student
+
 ### Authentication
 - **`submit_mfa_code`** — Complete MFA verification with a 6-digit code
 - Supports MCP elicitation for inline MFA prompts
@@ -61,6 +73,15 @@ Available on the [MCP Registry](https://registry.modelcontextprotocol.io) as `io
 - Credentials loaded from environment variables, 1Password, or LastPass CLI on session expiry
 
 ## Setup
+
+### Enabling admin write tools
+
+The admin write tools (`add_student`, `edit_student`, `add_parent`, `edit_parent`,
+`link_guardian_to_student`) modify the live school roster, so they are **off by
+default**. To enable them, set `PS_ENABLE_WRITES=1` (or `true`/`yes`/`on`) in the
+server's environment and restart. Every write attempt (including blocked ones) is
+appended as JSONL to `PS_AUDIT_LOG` (default `~/.parentsquare_audit.log`). Read
+tools (`list_students`, `list_parents`, `list_grades`, `get_student`) work regardless.
 
 ### Prerequisites
 
