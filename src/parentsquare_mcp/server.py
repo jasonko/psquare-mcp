@@ -1251,6 +1251,8 @@ async def list_students(
                 "name": s.name,
                 "grade": s.grade,
                 "student_sis_id": s.student_sis_id,
+                "state_id": s.state_id,
+                "account_status": s.account_status,
                 "guardians": s.parents,
             }
             for s in students
@@ -1295,6 +1297,7 @@ async def list_parents(
                 "name": p.name,
                 "email": p.email,
                 "phone": p.phone,
+                "secondary_phone": p.secondary_phone,
                 "students": p.students,
                 "registered": p.registered,
             }

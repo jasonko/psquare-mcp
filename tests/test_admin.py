@@ -14,8 +14,8 @@ from parentsquare_mcp.parsers import admin
 
 def test_parse_roster_students_maps_positional_columns():
     rows = [
-        [None, 56186074, None, "2nd Grade", "SIS-1", None, "Doe, Jane", "Alex Doe, Sam Roe",
-         "", "", None, 4, "No", None],
+        [None, 56186074, None, "2nd Grade", "SIS-1", "STATE-9", "Doe, Jane", "Alex Doe, Sam Roe",
+         "", "", "Active", 4, "No", None],
         [None, None, None, None, None, None, None, None, "", "", None, None, "No", None],  # skipped
     ]
     students = admin.parse_roster_students(rows)
@@ -27,12 +27,14 @@ def test_parse_roster_students_maps_positional_columns():
     assert s.student_sis_id == "SIS-1"
     assert s.parents == "Alex Doe, Sam Roe"
     assert s.grade_position == 4
+    assert s.state_id == "STATE-9"
+    assert s.account_status == "Active"
 
 
 def test_parse_roster_parents_maps_positional_columns():
     rows = [
         [None, 71734099, "Apike, Alex", "Jane Doe (2nd Grade)", "a@example.com",
-         "123-555-0100", "", "Jul 7, 2026", "Yes", "No", 1, None],
+         "123-555-0100", "123-555-0199", "Jul 7, 2026", "Yes", "No", 1, None],
     ]
     parents = admin.parse_roster_parents(rows)
     assert len(parents) == 1
@@ -43,6 +45,7 @@ def test_parse_roster_parents_maps_positional_columns():
     assert p.email == "a@example.com"
     assert p.phone == "123-555-0100"
     assert p.registered is True
+    assert p.secondary_phone == "123-555-0199"
 
 
 def test_parse_grades_from_select():

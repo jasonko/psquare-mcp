@@ -213,6 +213,8 @@ class RosterStudent:
     student_sis_id: str | None = None   # external/SIS id
     parents: str = ""             # comma-joined guardian display names
     grade_position: int | None = None
+    state_id: str | None = None   # state/CALPADS id (roster col 5)
+    account_status: str | None = None   # account status (roster col 10)
 
 
 @dataclass
@@ -225,6 +227,7 @@ class RosterParent:
     email: str | None = None
     phone: str | None = None
     registered: bool = False
+    secondary_phone: str | None = None   # secondary phone (roster col 6)
 
 
 @dataclass

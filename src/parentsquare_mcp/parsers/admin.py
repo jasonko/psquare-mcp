@@ -22,8 +22,10 @@ from parentsquare_mcp.models import (
 # --- roster positional-array feeds ------------------------------------------
 # `/schools/{id}/roster/students_data` -> {"data": [[...14 cols...], ...]}
 _S_ID, _S_GRADE, _S_SIS, _S_NAME, _S_PARENTS, _S_GRADE_POS = 1, 3, 4, 6, 7, 11
+_S_STATE, _S_STATUS = 5, 10
 # `/schools/{id}/roster/parents_data` -> {"data": [[...12 cols...], ...]}
 _P_UID, _P_NAME, _P_STUDENTS, _P_EMAIL, _P_PHONE, _P_REGISTERED = 1, 2, 3, 4, 5, 8
+_P_SECONDARY = 6
 
 
 def parse_roster_students(rows: list[list]) -> list[RosterStudent]:
@@ -40,6 +42,8 @@ def parse_roster_students(rows: list[list]) -> list[RosterStudent]:
                 student_sis_id=r[_S_SIS] or None,
                 parents=r[_S_PARENTS] or "",
                 grade_position=r[_S_GRADE_POS] if isinstance(r[_S_GRADE_POS], int) else None,
+                state_id=r[_S_STATE] or None,
+                account_status=r[_S_STATUS] or None,
             )
         )
     return out
@@ -59,6 +63,7 @@ def parse_roster_parents(rows: list[list]) -> list[RosterParent]:
                 email=r[_P_EMAIL] or None,
                 phone=r[_P_PHONE] or None,
                 registered=str(r[_P_REGISTERED]).strip().lower() == "yes",
+                secondary_phone=r[_P_SECONDARY] or None,
             )
         )
     return out
