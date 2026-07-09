@@ -32,10 +32,13 @@ from parentsquare_mcp.parsers.admin import (
     build_link_guardian_body,
     extract_parent_edit_fields,
     extract_student_edit_fields,
+    guardian_linked,
+    guardian_present,
     parse_grades,
     parse_roster_parents,
     parse_roster_students,
     parse_student_profile,
+    roster_has_student,
     write_succeeded,
 )
 from parentsquare_mcp.parsers.calendar import parse_ics_calendar
@@ -1191,6 +1194,55 @@ def _write_result(tool: str, args: dict, resp) -> str:
     return f"❌ Operation failed (HTTP {resp.status_code}). ParentSquare response: {snippet}"
 
 
+def _write_result_verified(tool: str, args: dict, resp, verified: bool | None) -> str:
+    """Interpret a form-write Response using a read-back result, audit, and format.
+
+    A 200 JS "reload" response only proves ParentSquare accepted the POST — some
+    silent failures still return one. The write tools therefore re-read
+    authoritative state and pass the outcome as ``verified``:
+
+    - ``True``  — the change was found on read-back (persisted).
+    - ``False`` — the POST was accepted but the change is absent (likely a silent
+      failure; this is the false-positive the old heuristic missed).
+    - ``None``  — the read-back itself could not run (e.g. MFA/network); the write
+      may well have succeeded but we can't confirm it.
+    """
+    http_ok = write_succeeded(resp.status_code, resp.headers.get("content-type", ""), resp.text)
+    if not http_ok:
+        audit_write(tool, args, False, detail=f"HTTP {resp.status_code}")
+        snippet = " ".join(resp.text.split())[:200]
+        return f"❌ Operation failed (HTTP {resp.status_code}). ParentSquare response: {snippet}"
+    if verified is False:
+        audit_write(tool, args, False, detail=f"HTTP {resp.status_code}; read-back not found")
+        return (
+            "⚠️ ParentSquare accepted the request (HTTP 200) but a read-back could "
+            "not find the change, so it likely did NOT persist. Verify with "
+            "list_students / get_student before retrying."
+        )
+    if verified is None:
+        audit_write(tool, args, True, detail=f"HTTP {resp.status_code}; unverified")
+        return (
+            "✅ Submitted (HTTP 200), but automatic verification could not run. "
+            "Confirm the change with list_students / get_student."
+        )
+    audit_write(tool, args, True, detail=f"HTTP {resp.status_code}; verified")
+    return "✅ Success (verified)."
+
+
+async def _student_guardians(app, context, student_id: int):
+    """Read a student's current guardian list via the profile GraphQL. -> (guardians, err)."""
+    def _fetch():
+        data = app.client.graphql(
+            STUDENT_PROFILE_QUERY, {"studentId": student_id}, "StudentProfileView"
+        )
+        return parse_student_profile(data)
+
+    profile, err = await _with_mfa_retry(app, context, _fetch)
+    if err:
+        return None, err
+    return (profile.parents if profile else []), None
+
+
 def _write_gated(func):
     """Gate a write tool behind ``PS_ENABLE_WRITES``.
 
@@ -1392,7 +1444,11 @@ async def add_student(
     )
     if err:
         return err
-    return _write_result("add_student", args, resp)
+    students, verr = await _with_mfa_retry(
+        app, context, lambda: _roster_students(app.client, school_id)
+    )
+    verified = None if verr else roster_has_student(students, first_name, last_name)
+    return _write_result_verified("add_student", args, resp, verified)
 
 
 @mcp.tool(name="edit_student")
@@ -1499,7 +1555,9 @@ async def add_parent(
     )
     if err:
         return err
-    return _write_result("add_parent", args, resp)
+    guardians, verr = await _student_guardians(app, context, student_id)
+    verified = None if verr else guardian_present(guardians, first_name, last_name)
+    return _write_result_verified("add_parent", args, resp, verified)
 
 
 @mcp.tool(name="edit_parent")
@@ -1596,7 +1654,9 @@ async def link_guardian_to_student(
     )
     if err:
         return err
-    return _write_result("link_guardian_to_student", args, resp)
+    guardians, verr = await _student_guardians(app, context, student_id)
+    verified = None if verr else guardian_linked(guardians, user_id)
+    return _write_result_verified("link_guardian_to_student", args, resp, verified)
 
 
 # ---------------------------------------------------------------------------

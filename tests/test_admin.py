@@ -184,6 +184,43 @@ def test_write_succeeded_false_on_200_non_js():
     assert not admin.write_succeeded(200, "text/html", "<form>errors</form>")
 
 
+# --- read-back verification predicates --------------------------------------
+
+_GUARDIANS = [
+    {"name": "Alex Doe", "profile_path": "/schools/13749/users/71853816"},
+    {"name": "Sam  Roe", "profile_path": "/schools/13749/users/42"},
+]
+
+
+def test_guardian_present_matches_case_and_whitespace_insensitively():
+    assert admin.guardian_present(_GUARDIANS, "sam", "roe")
+    assert admin.guardian_present(_GUARDIANS, "Alex", "Doe")
+
+
+def test_guardian_present_false_when_absent():
+    assert not admin.guardian_present(_GUARDIANS, "Test", "Parent4")
+    assert not admin.guardian_present([], "Test", "Parent4")
+
+
+def test_guardian_linked_matches_user_id_in_profile_path():
+    assert admin.guardian_linked(_GUARDIANS, 71853816)
+    assert admin.guardian_linked(_GUARDIANS, "42")
+
+
+def test_guardian_linked_false_when_user_id_absent():
+    assert not admin.guardian_linked(_GUARDIANS, 99999)
+    assert not admin.guardian_linked([], 42)
+
+
+def test_roster_has_student_matches_last_comma_first():
+    students = admin.parse_roster_students([
+        [None, 56341978, None, "Test Grade (admin use only)", None, None,
+         "Student4, Test", "", None, None, None, 0],
+    ])
+    assert admin.roster_has_student(students, "Test", "Student4")
+    assert not admin.roster_has_student(students, "Test", "Student5")
+
+
 # --- write gate + audit ------------------------------------------------------
 
 def test_writes_enabled_default_off(monkeypatch):
@@ -261,3 +298,47 @@ def test_write_gated_preserves_signature():
 
     wrapped = _write_gated(add_student)
     assert list(inspect.signature(wrapped).parameters) == ["school_id", "first_name", "context"]
+
+
+# --- read-back-aware write result formatting ---------------------------------
+
+class _FakeResp:
+    def __init__(self, status_code=200, content_type="text/javascript", text="window.location.reload(true);"):
+        self.status_code = status_code
+        self.headers = {"content-type": content_type}
+        self.text = text
+
+
+def test_write_result_verified_reports_verified(tmp_path, monkeypatch):
+    from parentsquare_mcp.server import _write_result_verified
+
+    monkeypatch.setenv("PS_AUDIT_LOG", str(tmp_path / "audit.log"))
+    msg = _write_result_verified("add_parent", {}, _FakeResp(), True)
+    assert "verified" in msg.lower() and msg.startswith("✅")
+
+
+def test_write_result_verified_warns_when_not_found(tmp_path, monkeypatch):
+    from parentsquare_mcp.server import _write_result_verified
+
+    log = tmp_path / "audit.log"
+    monkeypatch.setenv("PS_AUDIT_LOG", str(log))
+    msg = _write_result_verified("add_parent", {}, _FakeResp(), False)
+    assert msg.startswith("⚠️") and "did NOT persist" in msg
+    assert json.loads(log.read_text().strip())["ok"] is False  # 200 body, still audited as failure
+
+
+def test_write_result_verified_unverified_when_readback_unavailable(tmp_path, monkeypatch):
+    from parentsquare_mcp.server import _write_result_verified
+
+    monkeypatch.setenv("PS_AUDIT_LOG", str(tmp_path / "audit.log"))
+    msg = _write_result_verified("add_parent", {}, _FakeResp(), None)
+    assert msg.startswith("✅") and "could not run" in msg
+
+
+def test_write_result_verified_http_failure_short_circuits(tmp_path, monkeypatch):
+    from parentsquare_mcp.server import _write_result_verified
+
+    monkeypatch.setenv("PS_AUDIT_LOG", str(tmp_path / "audit.log"))
+    resp = _FakeResp(status_code=404, content_type="text/html", text="<html>nope</html>")
+    msg = _write_result_verified("add_parent", {}, resp, True)  # verified ignored on HTTP failure
+    assert msg.startswith("❌") and "404" in msg
