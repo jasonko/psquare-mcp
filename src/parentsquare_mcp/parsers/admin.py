@@ -340,3 +340,36 @@ def write_succeeded(status_code: int, content_type: str, body: str) -> bool:
     if "javascript" not in (content_type or "").lower():
         return False
     return "reload" in body or "page_loading" in body
+
+
+# --- read-back verification --------------------------------------------------
+# A 200 JS "reload" response only proves ParentSquare *accepted* the form POST;
+# it does not prove the record persisted (some silent failures still reload).
+# The write tools re-read authoritative state after a write and confirm the
+# change with these predicates before reporting success.
+
+def _norm_name(s: str) -> str:
+    """Collapse whitespace and lowercase for tolerant name comparison."""
+    return " ".join((s or "").split()).strip().lower()
+
+
+def guardian_present(guardians: list[dict], first_name: str, last_name: str) -> bool:
+    """True if a guardian named ``first last`` is in a student's guardian list.
+
+    ``guardians`` is the ``parents`` list from ``parse_student_profile``
+    (each ``{"name": ..., "profile_path": ...}``).
+    """
+    target = _norm_name(f"{first_name} {last_name}")
+    return any(_norm_name(g.get("name", "")) == target for g in guardians)
+
+
+def guardian_linked(guardians: list[dict], user_id: int) -> bool:
+    """True if a guardian whose profile path references ``user_id`` is present."""
+    needle = f"/users/{int(user_id)}"
+    return any(needle in (g.get("profile_path") or "") for g in guardians)
+
+
+def roster_has_student(students, first_name: str, last_name: str) -> bool:
+    """True if the roster (``RosterStudent`` list) has a ``Last, First`` match."""
+    target = _norm_name(f"{last_name}, {first_name}")
+    return any(_norm_name(getattr(s, "name", "")) == target for s in students)

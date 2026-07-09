@@ -83,6 +83,15 @@ server's environment and restart. Every write attempt (including blocked ones) i
 appended as JSONL to `PS_AUDIT_LOG` (default `~/.parentsquare_audit.log`). Read
 tools (`list_students`, `list_parents`, `list_grades`, `get_student`) work regardless.
 
+ParentSquare's form endpoints answer every accepted POST with the same generic
+`200` "reload" response, which some silent failures also return. To avoid
+false-positive successes, the create/link tools (`add_student`, `add_parent`,
+`link_guardian_to_student`) **read back authoritative state after the write** and
+only report `✅ Success (verified)` once the new record is actually found. If the
+POST is accepted but the read-back can't find the change, they return a `⚠️`
+warning that it likely did not persist; if the read-back itself can't run, they
+report the write as submitted-but-unverified.
+
 ### Prerequisites
 
 Credentials can be provided in either of two ways (checked in this order):
