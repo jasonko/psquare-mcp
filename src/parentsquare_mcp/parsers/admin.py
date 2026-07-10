@@ -327,18 +327,41 @@ def build_link_guardian_body(school_id: int, student_id: int, grade_id: int) -> 
     }
 
 
+def build_bulk_invite_body(user_ids: list[int]) -> dict:
+    """Build the JSON body for the bulk parent-invite endpoint.
+
+    POST /schools/{id}/users/invite expects a comma-joined ``ids`` string (not a
+    JSON array), a ``role``, and the selected count. ParentSquare skips any ids
+    that are already registered.
+    """
+    return {
+        "ids": ",".join(str(int(u)) for u in user_ids),
+        "role": "PARENT",
+        "selected": len(user_ids),
+    }
+
+
 # --- response interpretation -------------------------------------------------
 
 def write_succeeded(status_code: int, content_type: str, body: str) -> bool:
     """Return True if a form-write response indicates success.
 
-    Success = HTTP 200 with a JS body containing a page reload directive.
-    Failures return an HTML error page (e.g. 404) or a non-200 status.
+    Success = HTTP 200 with a ``text/javascript`` body that is either a page
+    reload directive (student/parent roster writes) or a success flash
+    (``alert-success``, used by the invite endpoints). An ``alert-danger`` /
+    ``alert-error`` flash is treated as failure even if a generic reload/loading
+    script is also present. Failures otherwise return an HTML error page (e.g.
+    404) or a non-200 status.
     """
     if status_code != 200:
         return False
     if "javascript" not in (content_type or "").lower():
         return False
+    low = body.lower()
+    if "alert-danger" in low or "alert-error" in low:
+        return False
+    if "alert-success" in low:
+        return True
     return "reload" in body or "page_loading" in body
 
 
@@ -373,3 +396,22 @@ def roster_has_student(students, first_name: str, last_name: str) -> bool:
     """True if the roster (``RosterStudent`` list) has a ``Last, First`` match."""
     target = _norm_name(f"{last_name}, {first_name}")
     return any(_norm_name(getattr(s, "name", "")) == target for s in students)
+
+
+_FLASH_RE = re.compile(r'flash_(?:notice|alert)\\?">(.*?)<\\?/span>', re.S)
+
+
+def parse_flash_message(body: str) -> str | None:
+    """Extract the flash notice/alert text from a Rails UJS flash body.
+
+    ParentSquare's invite endpoints reply with a
+    ``$(".flash-message").replaceWith("…<span id=\\"flash_notice\\">…<\\/span>…")``
+    script. Returns the human-readable message (JS-unescaped, whitespace
+    collapsed) or ``None`` if no flash span is present.
+    """
+    match = _FLASH_RE.search(body or "")
+    if not match:
+        return None
+    text = match.group(1).replace("\\/", "/").replace('\\"', '"')
+    text = " ".join(text.split())
+    return text or None

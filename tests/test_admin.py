@@ -221,6 +221,54 @@ def test_roster_has_student_matches_last_comma_first():
     assert not admin.roster_has_student(students, "Test", "Student5")
 
 
+# --- invitations -------------------------------------------------------------
+
+# Real captured flash bodies (verified live 2026-07-09 against Test Grade records).
+_SINGLE_INVITE_OK = (
+    '$(".flash-message").replaceWith("\\n<div class=\\"flash-message\\">\\n'
+    '<div role=\\"alert\\" class=\\"alert alert-dismissable alert-success\\">\\n'
+    '<span id=\\"flash_notice\\">Successfully sent invitation email to user.<\\/span>\\n'
+    '<\\/div>\\n<\\/div>");'
+)
+_BULK_INVITE_OK = (
+    '$(".flash-message").replaceWith("\\n<div class=\\"flash-message\\">\\n'
+    '<div role=\\"alert\\" class=\\"alert alert-dismissable alert-success\\">\\n'
+    '<span id=\\"flash_notice\\">Successfully sent email/text to 2 unregistered '
+    'out of 2 selected users<\\/span>\\n<\\/div>\\n<\\/div>");'
+)
+_INVITE_FAIL = (
+    '$(".flash-message").replaceWith("\\n<div class=\\"flash-message\\">\\n'
+    '<div role=\\"alert\\" class=\\"alert alert-dismissable alert-danger\\">\\n'
+    '<span id=\\"flash_alert\\">Something went wrong.<\\/span>\\n<\\/div>\\n<\\/div>");'
+)
+
+
+def test_write_succeeded_true_on_success_flash():
+    assert admin.write_succeeded(200, "text/javascript; charset=utf-8", _SINGLE_INVITE_OK)
+    assert admin.write_succeeded(200, "text/javascript; charset=utf-8", _BULK_INVITE_OK)
+
+
+def test_write_succeeded_false_on_danger_flash_even_with_reload():
+    # A generic reload/loading script alongside an error flash must not read as success.
+    body = _INVITE_FAIL + " $('#page_loading').show();"
+    assert not admin.write_succeeded(200, "text/javascript; charset=utf-8", body)
+
+
+def test_parse_flash_message_single_and_bulk():
+    assert admin.parse_flash_message(_SINGLE_INVITE_OK) == "Successfully sent invitation email to user."
+    assert (
+        admin.parse_flash_message(_BULK_INVITE_OK)
+        == "Successfully sent email/text to 2 unregistered out of 2 selected users"
+    )
+    assert admin.parse_flash_message(_INVITE_FAIL) == "Something went wrong."
+    assert admin.parse_flash_message("$('#page_loading').show();") is None
+
+
+def test_build_bulk_invite_body():
+    b = admin.build_bulk_invite_body([71672653, 71853816])
+    assert b == {"ids": "71672653,71853816", "role": "PARENT", "selected": 2}
+
+
 # --- write gate + audit ------------------------------------------------------
 
 def test_writes_enabled_default_off(monkeypatch):

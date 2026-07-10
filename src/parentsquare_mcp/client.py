@@ -116,6 +116,30 @@ class PSClient:
         self._save_cookies_if_changed()
         return resp.json()
 
+    def post_json_raw(self, path: str, payload: dict) -> requests.Response:
+        """POST a JSON body but return the raw Response (not parsed JSON).
+
+        Some admin actions accept a JSON request yet reply with a Rails UJS
+        ``text/javascript`` body (e.g. the bulk parent-invite endpoint), so
+        ``post_json``'s ``resp.json()`` would raise. Fetches the CSRF token
+        automatically and does NOT raise on 4xx/5xx — callers inspect the
+        status/body (see ``write_succeeded``).
+        """
+        csrf_token = self._get_csrf_token()
+        resp = self.session.post(
+            f"{BASE_URL}{path}",
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-CSRF-Token": csrf_token,
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": BASE_URL,
+            },
+        )
+        self._save_cookies_if_changed()
+        return resp
+
     def post_form(self, path: str, data: dict) -> requests.Response:
         """POST an application/x-www-form-urlencoded body (Rails admin write form).
 
