@@ -27,6 +27,7 @@ from parentsquare_mcp.parsers.admin import (
     STUDENT_PROFILE_QUERY,
     build_add_parent_body,
     build_add_student_body,
+    build_bulk_invite_body,
     build_edit_parent_body,
     build_edit_student_body,
     build_link_guardian_body,
@@ -34,6 +35,7 @@ from parentsquare_mcp.parsers.admin import (
     extract_student_edit_fields,
     guardian_linked,
     guardian_present,
+    parse_flash_message,
     parse_grades,
     parse_roster_parents,
     parse_roster_students,
@@ -1185,11 +1187,19 @@ def _student_grade_id(client: PSClient, school_id: int, student_id: int) -> str:
 
 
 def _write_result(tool: str, args: dict, resp) -> str:
-    """Interpret a form-write Response, audit it, and format a user message."""
+    """Interpret a form-write Response, audit it, and format a user message.
+
+    Surfaces ParentSquare's own flash message when present (e.g. the invite
+    endpoints report how many users were actually notified).
+    """
     ok = write_succeeded(resp.status_code, resp.headers.get("content-type", ""), resp.text)
-    audit_write(tool, args, ok, detail=f"HTTP {resp.status_code}")
+    flash = parse_flash_message(resp.text)
+    detail = f"HTTP {resp.status_code}" + (f": {flash}" if flash else "")
+    audit_write(tool, args, ok, detail=detail)
     if ok:
-        return "✅ Success."
+        return f"✅ {flash}" if flash else "✅ Success."
+    if flash:
+        return f"❌ {flash} (HTTP {resp.status_code})"
     snippet = " ".join(resp.text.split())[:200]
     return f"❌ Operation failed (HTTP {resp.status_code}). ParentSquare response: {snippet}"
 
@@ -1657,6 +1667,66 @@ async def link_guardian_to_student(
     guardians, verr = await _student_guardians(app, context, student_id)
     verified = None if verr else guardian_linked(guardians, user_id)
     return _write_result_verified("link_guardian_to_student", args, resp, verified)
+
+
+@mcp.tool(name="invite_parent")
+@_write_gated
+async def invite_parent(
+    school_id: int,
+    user_id: int,
+    context: Context[Any, Any] = None,
+) -> str:
+    """Send (or resend) a ParentSquare registration invitation to one guardian. Requires PS_ENABLE_WRITES.
+
+    ParentSquare emails the guardian an invite to activate their account. The
+    same endpoint is used to resend to an already-invited (but not yet
+    registered) guardian. Get the user_id from list_parents(school_id); only
+    guardians with registered=false need inviting.
+
+    Args:
+        school_id: School ID
+        user_id: Guardian's user ID (from list_parents)
+    """
+    app = _app(context)
+    args = {"school_id": school_id, "user_id": user_id}
+    resp, err = await _with_mfa_retry(
+        app, context, lambda: app.client.post_form(f"/schools/{school_id}/users/{user_id}/invite", {})
+    )
+    if err:
+        return err
+    return _write_result("invite_parent", args, resp)
+
+
+@mcp.tool(name="bulk_invite_parents")
+@_write_gated
+async def bulk_invite_parents(
+    school_id: int,
+    user_ids: list[int],
+    context: Context[Any, Any] = None,
+) -> str:
+    """Send registration invitations to multiple guardians at once. Requires PS_ENABLE_WRITES.
+
+    ParentSquare sends each unregistered guardian an email/text invite and
+    automatically skips any that are already registered (the returned message
+    reports how many of the selected users were actually notified). Get user_ids
+    from list_parents(school_id) — typically those with registered=false. To
+    "invite all", pass every unregistered user_id from list_parents.
+
+    Args:
+        school_id: School ID
+        user_ids: Guardian user IDs to invite (from list_parents)
+    """
+    app = _app(context)
+    if not user_ids:
+        return "❌ No user_ids provided — nothing to invite."
+    args = {"school_id": school_id, "user_ids": user_ids}
+    body = build_bulk_invite_body(user_ids)
+    resp, err = await _with_mfa_retry(
+        app, context, lambda: app.client.post_json_raw(f"/schools/{school_id}/users/invite", body)
+    )
+    if err:
+        return err
+    return _write_result("bulk_invite_parents", args, resp)
 
 
 # ---------------------------------------------------------------------------
