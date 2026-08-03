@@ -13,9 +13,8 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.fastmcp.utilities.types import Image
-from mcp.shared.exceptions import McpError
+from mcp.server.mcpserver import Context, Image, MCPServer
+from mcp.shared.exceptions import MCPError
 from pydantic import BaseModel, Field
 
 from parentsquare_mcp.auth import MFARequiredError, MFAState, load_cookies, submit_mfa
@@ -75,7 +74,7 @@ class AppContext:
 
 
 @asynccontextmanager
-async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
+async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
     """Set up session and yield client. Auth is fully lazy — cookies are loaded
     if available, but 1Password and login only happen on the first actual request
     that needs authentication (via PSClient._relogin).
@@ -107,7 +106,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     yield AppContext(client=client, download_dir=download_dir, mfa_state=mfa_state)
 
 
-mcp = FastMCP("ParentSquare", lifespan=app_lifespan)
+mcp = MCPServer("ParentSquare", lifespan=app_lifespan)
 
 
 def _app(ctx: Context[Any, Any]) -> AppContext:
@@ -186,7 +185,7 @@ async def _handle_mfa(app: AppContext, exc: MFARequiredError, ctx: Context[Any, 
             return "MFA verification declined. Use submit_mfa_code tool later to complete login."
         else:  # cancel
             return "MFA verification cancelled. Use submit_mfa_code tool later to complete login."
-    except McpError:
+    except MCPError:
         # Client doesn't support elicitation — fall back to text message
         return str(exc)
 
@@ -1270,7 +1269,7 @@ def _write_gated(func):
 
     When writes are disabled, the blocked attempt is audited and the friendly
     disabled message is returned without invoking the tool. ``functools.wraps``
-    preserves the wrapped function's signature so FastMCP still builds the
+    preserves the wrapped function's signature so MCPServer still builds the
     correct tool schema (it introspects via ``inspect.signature``, which follows
     ``__wrapped__``).
     """

@@ -28,7 +28,7 @@ classifiers = [
     "Topic :: Education",
 ]
 dependencies = [
-    "mcp>=1.26.0",
+    "mcp>=2.0.0,<3",
     "requests>=2.32.0",
     "beautifulsoup4>=4.13.0",
     "icalendar>=6.0.0",
