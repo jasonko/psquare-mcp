@@ -116,14 +116,14 @@ Before the first CI-driven release, add a "pending" trusted publisher on pypi.or
 1. Log into [pypi.org](https://pypi.org) as the account that owns the project.
 2. Go to [Manage → Publishing → Add a new pending publisher](https://pypi.org/manage/account/publishing/).
 3. Fill in:
-   - **PyPI Project Name**: `parentsquare-mcp`
-   - **Owner**: `thehesiod`
+   - **PyPI Project Name**: `psquare-mcp`
+   - **Owner**: `jasonko`
    - **Repository name**: `psquare-mcp`
    - **Workflow name**: `publish.yml`
    - **Environment name**: *(leave blank, or set e.g. `release` for a manual-approval gate)*
 4. Save. The publisher activates on the first successful tag push that runs `publish.yml`.
 
-*(The MCP Registry namespace `io.github.thehesiod/*` is already auto-authorized for the `thehesiod` GitHub account via OIDC — no pypi-style pending-publisher setup needed.)*
+*(The MCP Registry namespace `io.github.jasonko/*` is already auto-authorized for the `jasonko` GitHub account via OIDC — no pypi-style pending-publisher setup needed.)*
 
 ### Cutting a release
 
@@ -143,7 +143,7 @@ Before the first CI-driven release, add a "pending" trusted publisher on pypi.or
 
 ### Ownership proof for the MCP Registry
 
-The PyPI package README must contain the literal line `mcp-name: io.github.thehesiod/psquare` (see the bottom of `README.md`). The registry's publisher validates this by fetching the published PyPI artifact and looking for that string. Removing the line will break future registry publishes.
+The PyPI package README must contain the literal line `mcp-name: io.github.jasonko/psquare` (see the bottom of `README.md`). The registry's publisher validates this by fetching the published PyPI artifact and looking for that string. Removing the line will break future registry publishes.
 
 ## Open Improvement Areas
 

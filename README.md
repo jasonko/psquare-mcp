@@ -1,10 +1,10 @@
 # ParentSquare MCP Server
 
-[![MCP Registry](https://img.shields.io/badge/MCP-Registry-blue)](https://registry.modelcontextprotocol.io) [![PyPI](https://img.shields.io/pypi/v/parentsquare-mcp)](https://pypi.org/project/parentsquare-mcp/)
+[![MCP Registry](https://img.shields.io/badge/MCP-Registry-blue)](https://registry.modelcontextprotocol.io) [![PyPI](https://img.shields.io/pypi/v/psquare-mcp)](https://pypi.org/project/psquare-mcp/)
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that gives Claude access to [ParentSquare](https://www.parentsquare.com), a school-parent communication platform. Since ParentSquare has no public API, this server scrapes the web interface using saved session cookies.
 
-Available on the [MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.thehesiod/psquare` and on [PyPI](https://pypi.org/project/parentsquare-mcp/) as `parentsquare-mcp`.
+Available on the [MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.jasonko/psquare` and on [PyPI](https://pypi.org/project/psquare-mcp/) as `psquare-mcp`.
 
 ## Disclaimer
 
@@ -104,13 +104,13 @@ Credentials can be provided in either of two ways (checked in this order):
 ### Install in Claude Code
 
 ```bash
-claude mcp add --transport stdio parentsquare -- uvx --from "parentsquare-mcp @ git+https://github.com/thehesiod/psquare-mcp" parentsquare-mcp
+claude mcp add --transport stdio parentsquare -- uvx --from "psquare-mcp @ git+https://github.com/jasonko/psquare-mcp" parentsquare-mcp
 ```
 
 To enable PDF text extraction for post attachments (optional, AGPL-3.0 licensed):
 
 ```bash
-claude mcp add --transport stdio parentsquare -- uvx --from "parentsquare-mcp[pdf] @ git+https://github.com/thehesiod/psquare-mcp" parentsquare-mcp
+claude mcp add --transport stdio parentsquare -- uvx --from "psquare-mcp[pdf] @ git+https://github.com/jasonko/psquare-mcp" parentsquare-mcp
 ```
 
 ### That's It
@@ -124,7 +124,7 @@ To use environment variables with Claude Code, add an `env` block to your MCP co
   "mcpServers": {
     "parentsquare": {
       "command": "uvx",
-      "args": ["parentsquare-mcp"],
+      "args": ["--from", "psquare-mcp", "parentsquare-mcp"],
       "env": {
         "PS_USERNAME": "your@email.com",
         "PS_PASSWORD": "your-password"
@@ -143,7 +143,7 @@ To use the LastPass CLI instead of 1Password, log in once (`lpass login <your-la
   "mcpServers": {
     "parentsquare": {
       "command": "uvx",
-      "args": ["parentsquare-mcp"],
+      "args": ["--from", "psquare-mcp", "parentsquare-mcp"],
       "env": {
         "PS_CREDENTIAL_PROVIDER": "lastpass",
         "PS_LASTPASS_ITEM": "parentsquare.com"
@@ -185,4 +185,4 @@ Groups use a GraphQL endpoint (`/graphql`) instead of HTML scraping. The directo
 
 MIT — see [LICENSE](LICENSE). Note: the optional `pymupdf` dependency is AGPL-3.0 licensed.
 
-mcp-name: io.github.thehesiod/psquare
+mcp-name: io.github.jasonko/psquare
