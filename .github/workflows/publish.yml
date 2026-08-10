@@ -41,6 +41,18 @@ jobs:
             exit 1
           fi
 
+      - name: Verify server.json description fits the MCP Registry limit
+        run: |
+          set -e
+          python - <<'PY'
+          import json, sys
+          desc = json.load(open("server.json"))["description"]
+          if len(desc) > 100:
+              print(f"::error::server.json description is {len(desc)} chars; the MCP Registry rejects anything over 100.")
+              sys.exit(1)
+          print(f"server.json description length OK ({len(desc)}/100)")
+          PY
+
       - name: Build wheel and sdist
         run: uv build
 

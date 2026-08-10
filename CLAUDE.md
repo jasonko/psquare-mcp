@@ -128,6 +128,8 @@ Before the first CI-driven release, add a "pending" trusted publisher on pypi.or
 ### Cutting a release
 
 1. Bump the version in **both** `pyproject.toml` and `server.json` (the workflow fails if they don't match — both `version` and `packages[0].version` in `server.json`).
+   - **`server.json`'s `description` must be <= 100 characters** — the MCP Registry rejects longer ones with a 422. The workflow validates this before building. (`pyproject.toml`'s `description`, used for the PyPI summary, has no such limit.)
+   - PyPI metadata (summary, keywords, README) is **immutable per release** — updating the description requires publishing a new version.
 2. Commit: `chore: bump to X.Y.Z`.
 3. Tag + push (tags are bare semver — no `v` prefix):
    ```bash
