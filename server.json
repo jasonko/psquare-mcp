@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.jasonko/psquare",
-  "description": "MCP server for ParentSquare school-parent communication platform",
+  "description": "MCP server for ParentSquare — parent-facing feeds, calendars, messages and directories, plus admin roster management for students and guardians",
   "repository": {
     "url": "https://github.com/jasonko/psquare-mcp",
     "source": "github"
   },
-  "version": "0.2.0",
+  "version": "0.2.1",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "psquare-mcp",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "transport": {
         "type": "stdio"
       }

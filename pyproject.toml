@@ -1,7 +1,7 @@
 [project]
 name = "psquare-mcp"
-version = "0.2.0"
-description = "MCP server that gives Claude AI access to ParentSquare, the school-parent communication platform — browse feeds, calendar events, messages, directories, and more"
+version = "0.2.1"
+description = "MCP server that gives Claude AI access to ParentSquare — feeds, calendar events, messages, directories, plus admin roster management for students and guardians"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
@@ -15,6 +15,9 @@ keywords = [
     "education",
     "parent-teacher",
     "school-communication",
+    "roster",
+    "school-admin",
+    "student-information-system",
 ]
 authors = [{ name = "jasonko" }]
 classifiers = [

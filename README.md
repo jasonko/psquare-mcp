@@ -4,6 +4,8 @@
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that gives Claude access to [ParentSquare](https://www.parentsquare.com), a school-parent communication platform. Since ParentSquare has no public API, this server scrapes the web interface using saved session cookies.
 
+Covers both the **parent/guardian experience** (feeds, posts, calendars, messages, directories, sign-ups, forms, payments) and **school admin roster management** — reading student and guardian rosters, and creating/editing students and guardians plus sending registration invitations. Admin write tools are **off by default**, gated behind `PS_ENABLE_WRITES`, and every write is recorded to a local audit log.
+
 Available on the [MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.jasonko/psquare` and on [PyPI](https://pypi.org/project/psquare-mcp/) as `psquare-mcp`.
 
 ## Disclaimer
@@ -65,6 +67,8 @@ Read tools are always available; **write tools are disabled by default** and onl
 - **`add_parent`** *(write)* — Create a guardian linked to a student
 - **`edit_parent`** *(write)* — Update a guardian's name, email, or phone (existing links preserved)
 - **`link_guardian_to_student`** *(write)* — Link an existing guardian to an additional student
+- **`invite_parent`** *(write)* — Send (or resend) a ParentSquare registration invitation to one guardian
+- **`bulk_invite_parents`** *(write)* — Invite many guardians at once; already-registered guardians are skipped automatically
 
 ### Authentication
 - **`submit_mfa_code`** — Complete MFA verification with a 6-digit code
