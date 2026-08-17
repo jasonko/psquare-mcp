@@ -93,8 +93,26 @@ v3 scope, reverse-engineered from the rollover admin UI's JS bundle and verified
 - **New classes are created hidden** (invisible to staff, parents and students) — matching the website's two-step flow — so `add_class` must be followed by `set_class_visibility`. Visibility is date-driven, not a boolean: making a class visible submits a `visibility_start_date` and hiding it submits a `visibility_end_date`; `set_class_visibility` defaults both to today. The bundle's `clear_field` parameter means *unschedule*, not "apply now" — sending it to an already-hidden class returns 200 and silently does nothing (a false-positive success).
 - **"Clear all room parents for the new school year"** is deliberately not a tool: the agent loops `list_classes` → `remove_class_staff(section_id, role="ROOM_PARENT")` per class.
 
+### Admin write tools (student class enrollment)
+v4 scope, reverse-engineered from `/schools/{id}/roster/assign_classes` and its `RostersAssignClassController`, and verified live on test fixtures. Parsing + body builders live in `parsers/enrollment.py`. JSON:API endpoints, so use `send_json` + `json_write_ok()`/`json_write_error()` (same as classes/staff), not the UJS helpers. Same write gate + audit log.
+
+- **Endpoints:**
+  - `GET /api/v2/sections/{id}/students` — class roster. Backs `list_class_students`.
+  - `PUT /api/v2/sections/{id}/add_students` — **additive**, cannot wipe. Body `{"section_id": "<id>", "data": [{"type": "student", "id": "<sid>"}]}`. Returns the resulting roster. Backs `add_class_students`.
+  - `PUT /api/v2/students/{id}/sections` — **full replace** of one student's class list. Body `{"student_id": "<id>", "data": [{"id": "<section_id>", "type": "section"}]}`; `data: []` clears every class. Backs removals and moves.
+  - `DELETE /api/v2/sections/{id}/students` — removes **all** students from a class. **Deliberately not exposed** (v1 destructive-op policy).
+  - `GET /api/v2/students/{id}/sections` **404s** — the route is PUT-only.
+- **There is no cheap per-student read of current classes.** The GraphQL `StudentProfileSectionView` exposes no `id`/`sectionId`, and the student edit form is useless (see the gotcha below). Instead `/schools/{id}/roster/assign_classes` server-renders **every** student's classes as `<span class="student-sections-{student_id}" data-section-id data-section-name>` — **one HTTP call yields the whole-school map** (`parse_student_sections_map`). Students with no classes render no spans, so a **missing key means "no classes", not "unknown student"**.
+- **Removals and moves are read-modify-write** over that map, because the only removal primitive is the full-replace PUT: read the student's classes, drop/swap one, PUT the rest back. This is why `remove_class_students` and `move_student_to_class` take a `school_id`.
+- **`remove_class_students` refuses an empty `student_ids` list** — an empty list must never degrade into "empty the class". `add_class_students` skips ids already enrolled, so re-running is safe.
+- **No multi-class bulk endpoint exists** (`bulk_update_sections` is term dates; `bulk_update_class_visibility` is visibility). Start-of-year assignment is therefore an agent loop of `add_class_students` — one call per classroom, not per student. A loop-free mega-tool was considered and rejected: it would save zero HTTP calls while removing per-classroom checkpoints.
+- **CSV import is not a viable alternative**: `sections/sample_roster_csv` matches rows on **Student External ID** with no name/email fallback, and 290 of 644 students have no SIS id.
+
 
 ## Known Gotchas
+
+### The student edit form lies about class enrollment
+`<select name="student[section_ids][]">` on `/schools/{id}/students/{sid}/edit` is server-rendered with the grade's available classes but **never marks any option `selected`**, and `data-initval` is always `"[]"` — the current enrollment is fetched separately by JS. Scraping it therefore returns `[]` for every student, and echoing that back as `student[section_ids][]=""` makes Rails **unenroll the student from every class**. This shipped as a live data-loss bug in `edit_student` (fixed: `extract_student_edit_fields` no longer reads the field, and `build_edit_student_body` **omits** the key unless a caller passes an explicit list). General rule, same as `kids_attributes` on parent PATCHes: **omit any nested/collection key you did not intend to change** — Rails treats present-but-empty as "clear it".
 
 ### `get_json`'s Accept header must stay JSON-only
 `PSClient.get_json()` sends `Accept: application/json`. Widening it to the browser's `application/json, text/javascript, */*; q=0.01` **breaks the Rails roster feeds** (`/schools/{id}/roster/parents_data`, `students_data`, `staff_data`): `respond_to` then picks the JS format, which has no template, and the request 404s — silently taking down `list_parents` / `list_students` / `list_staff`. The `/api/v2/` endpoints are happy either way.

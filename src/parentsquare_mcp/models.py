@@ -296,6 +296,21 @@ class ClassDetail:
 
 
 @dataclass
+class ClassStudent:
+    """A student on a class roster, from ``/api/v2/sections/{id}/students``."""
+
+    student_id: int
+    first_name: str = ""
+    last_name: str = ""
+    full_name: str = ""
+    student_sis_id: str | None = None
+
+    @property
+    def name(self) -> str:
+        return self.full_name or f"{self.first_name} {self.last_name}".strip()
+
+
+@dataclass
 class RosterStaff:
     """A staff member row from the ``staff_data`` admin feed."""
 

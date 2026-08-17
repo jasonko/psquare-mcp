@@ -206,6 +206,24 @@ class PSClient:
         self._save_cookies_if_changed()
         return resp.text
 
+    def get_html(self, path: str, params: dict | None = None) -> str:
+        """GET an HTML admin page and return the raw response text.
+
+        Distinct from ``get_text``: this sends the session's normal browser
+        ``Accept`` header rather than ``text/javascript`` + ``X-Requested-With``.
+        Rails ``respond_to`` picks a format from those headers, so asking for JS
+        on a plain HTML page yields a template-less 404 — the same trap
+        documented on ``get_json``.
+        """
+        url = f"{BASE_URL}{path}"
+        resp = self.session.get(url, params=params)
+        if "/signin" in resp.url:
+            self._relogin()
+            resp = self.session.get(url, params=params)
+        resp.raise_for_status()
+        self._save_cookies_if_changed()
+        return resp.text
+
     def get_json(self, path: str, params: dict | None = None) -> dict:
         """GET a JSON API endpoint and return parsed response.
 

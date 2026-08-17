@@ -59,6 +59,13 @@ from parentsquare_mcp.parsers.classes import (
     parse_sections_mini,
 )
 
+from parentsquare_mcp.parsers.enrollment import (
+    build_add_students_body,
+    build_student_sections_body,
+    parse_class_students,
+    parse_student_sections_map,
+)
+
 from parentsquare_mcp.parsers.feeds import parse_feed_page, parse_post_detail
 from parentsquare_mcp.models import ClassStaff, Group
 from parentsquare_mcp.parsers.groups import parse_group_feed
@@ -2321,6 +2328,242 @@ async def remove_class_staff(
         names = ", ".join(s.name or str(s.user_id) for s in removing)
         return f"✅ Removed {len(removing)} from \"{current.name}\": {names}."
     return result
+
+
+# ---------------------------------------------------------------------------
+# Student class enrollment
+# ---------------------------------------------------------------------------
+
+
+def _class_students(client: PSClient, section_id: int):
+    """Read a class roster. -> list[ClassStudent]."""
+    return parse_class_students(client.get_json(f"/api/v2/sections/{section_id}/students"))
+
+
+async def _load_class_students(app, context, section_id: int):
+    """Read a class roster with MFA retry. -> (list[ClassStudent]|None, err)."""
+    return await _with_mfa_retry(app, context, lambda: _class_students(app.client, section_id))
+
+
+async def _load_sections_map(app, context, school_id: int):
+    """Read the whole school's student -> classes map. -> (dict|None, err).
+
+    One request covers every student, because there is no per-student read:
+    ``GET /api/v2/students/{id}/sections`` 404s and the GraphQL profile exposes
+    no section id.
+    """
+    return await _with_mfa_retry(
+        app,
+        context,
+        lambda: parse_student_sections_map(
+            app.client.get_html(f"/schools/{school_id}/roster/assign_classes")
+        ),
+    )
+
+
+async def _replace_student_sections(app, context, tool: str, args: dict,
+                                    student_id: int, section_ids: list[int]):
+    """PUT a student's full class list (the endpoint replaces, never merges)."""
+    body = build_student_sections_body(student_id, section_ids)
+    resp, err = await _with_mfa_retry(
+        app,
+        context,
+        lambda: app.client.send_json("PUT", f"/api/v2/students/{student_id}/sections", body),
+    )
+    if err:
+        return err
+    return _json_write_result(tool, args, resp)
+
+
+@mcp.tool(name="list_class_students")
+async def list_class_students(section_id: int, context: Context[Any, Any] = None) -> dict | str:
+    """List the students enrolled in one class.
+
+    Args:
+        section_id: Class/section ID (from list_classes)
+    """
+    app = _app(context)
+    students, err = await _load_class_students(app, context, section_id)
+    if err:
+        return err
+    return {
+        "section_id": section_id,
+        "count": len(students),
+        "students": [
+            {
+                "student_id": s.student_id,
+                "name": s.name,
+                "first_name": s.first_name,
+                "last_name": s.last_name,
+                "student_sis_id": s.student_sis_id,
+            }
+            for s in students
+        ],
+    }
+
+
+@mcp.tool(name="add_class_students")
+@_write_gated
+async def add_class_students(
+    section_id: int,
+    student_ids: list[int],
+    context: Context[Any, Any] = None,
+) -> str:
+    """Enroll students in a class. Requires PS_ENABLE_WRITES.
+
+    Adds everyone listed in a single call without disturbing the students
+    already in the class or their other classes. Students already enrolled are
+    skipped, so re-running is safe.
+
+    To assign a whole grade at the start of the year, call this once per
+    classroom with that classroom's students — list_students(grade=...) gives
+    the ids.
+
+    Args:
+        section_id: Class/section ID (from list_classes)
+        student_ids: One or more student IDs (from list_students)
+    """
+    app = _app(context)
+    args = {"section_id": section_id, "student_ids": student_ids}
+    if not student_ids:
+        return "❌ No student_ids provided — nothing to add."
+    wanted = list(dict.fromkeys(student_ids))
+
+    current, err = await _load_class_students(app, context, section_id)
+    if err:
+        return err
+    enrolled = {s.student_id for s in current}
+    already = [s for s in wanted if s in enrolled]
+    adding = [s for s in wanted if s not in enrolled]
+    if not adding:
+        return f"ℹ️ All {len(already)} already in the class — no change made."
+
+    body = build_add_students_body(section_id, adding)
+    resp, err = await _with_mfa_retry(
+        app,
+        context,
+        lambda: app.client.send_json("PUT", f"/api/v2/sections/{section_id}/add_students", body),
+    )
+    if err:
+        return err
+    result = _json_write_result("add_class_students", args, resp)
+    if not result.startswith("✅"):
+        return result
+    msg = f"✅ Added {len(adding)} student(s) to the class."
+    if already:
+        msg += f" ({len(already)} were already enrolled.)"
+    return msg
+
+
+@mcp.tool(name="remove_class_students")
+@_write_gated
+async def remove_class_students(
+    school_id: int,
+    section_id: int,
+    student_ids: list[int],
+    context: Context[Any, Any] = None,
+) -> str:
+    """Remove specific students from a class. Requires PS_ENABLE_WRITES.
+
+    Each student's other classes are read first and preserved — only this class
+    is dropped. student_ids is required: this tool will not empty a class.
+
+    Args:
+        school_id: School ID the class belongs to
+        section_id: Class/section ID (from list_classes)
+        student_ids: The students to remove (from list_class_students)
+    """
+    app = _app(context)
+    args = {"school_id": school_id, "section_id": section_id, "student_ids": student_ids}
+    if not student_ids:
+        return "❌ No student_ids provided — refusing to remove all students from the class."
+    wanted = list(dict.fromkeys(student_ids))
+
+    current, err = await _load_class_students(app, context, section_id)
+    if err:
+        return err
+    enrolled = {s.student_id: s for s in current}
+    removing = [s for s in wanted if s in enrolled]
+    if not removing:
+        return "ℹ️ None of those students are in this class — no change made."
+
+    sections_map, err = await _load_sections_map(app, context, school_id)
+    if err:
+        return err
+
+    failures: list[str] = []
+    removed: list[str] = []
+    for student_id in removing:
+        keep = [
+            c["section_id"]
+            for c in sections_map.get(student_id, [])
+            if c["section_id"] != section_id
+        ]
+        result = await _replace_student_sections(
+            app, context, "remove_class_students", {**args, "student_id": student_id},
+            student_id, keep,
+        )
+        name = enrolled[student_id].name or str(student_id)
+        if result.startswith("✅"):
+            removed.append(name)
+        else:
+            failures.append(f"{name}: {result}")
+
+    if failures and not removed:
+        return "❌ Removed nobody. " + "; ".join(failures)
+    msg = f"✅ Removed {len(removed)} student(s) from the class: {', '.join(removed)}."
+    if failures:
+        msg += f" ⚠️ {len(failures)} failed: " + "; ".join(failures)
+    return msg
+
+
+@mcp.tool(name="move_student_to_class")
+@_write_gated
+async def move_student_to_class(
+    school_id: int,
+    student_id: int,
+    to_section_id: int,
+    from_section_id: int | None = None,
+    context: Context[Any, Any] = None,
+) -> str:
+    """Switch a student from one class to another. Requires PS_ENABLE_WRITES.
+
+    Applies both halves of the switch in a single request. The student's other
+    classes are preserved. Omit from_section_id to add the new class while
+    keeping every current one.
+
+    Args:
+        school_id: School ID the classes belong to
+        student_id: Student ID (from list_students)
+        to_section_id: Class to move the student into (from list_classes)
+        from_section_id: Class to move them out of (optional)
+    """
+    app = _app(context)
+    args = {"school_id": school_id, "student_id": student_id,
+            "to_section_id": to_section_id, "from_section_id": from_section_id}
+    if from_section_id == to_section_id:
+        return "❌ from_section_id and to_section_id are the same — nothing to do."
+
+    sections_map, err = await _load_sections_map(app, context, school_id)
+    if err:
+        return err
+    current = [c["section_id"] for c in sections_map.get(student_id, [])]
+    if from_section_id is not None and from_section_id not in current:
+        return f"❌ Student {student_id} is not in class {from_section_id} — no change made."
+    if to_section_id in current and from_section_id is None:
+        return f"ℹ️ Student {student_id} is already in class {to_section_id} — no change made."
+
+    keep = [s for s in current if s != from_section_id]
+    if to_section_id not in keep:
+        keep.append(to_section_id)
+    result = await _replace_student_sections(
+        app, context, "move_student_to_class", args, student_id, keep
+    )
+    if not result.startswith("✅"):
+        return result
+    if from_section_id is None:
+        return f"✅ Added student {student_id} to class {to_section_id}."
+    return f"✅ Moved student {student_id} from class {from_section_id} to {to_section_id}."
 
 
 # ---------------------------------------------------------------------------
