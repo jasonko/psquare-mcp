@@ -412,20 +412,38 @@ def roster_has_student(students, first_name: str, last_name: str) -> bool:
     return any(_norm_name(getattr(s, "name", "")) == target for s in students)
 
 
-_FLASH_RE = re.compile(r'flash_(?:notice|alert)\\?">(.*?)<\\?/span>', re.S)
-
-
 def parse_flash_message(body: str) -> str | None:
-    """Extract the flash notice/alert text from a Rails UJS flash body.
+    """Extract ParentSquare's alert text from a Rails UJS response.
 
-    ParentSquare's invite endpoints reply with a
-    ``$(".flash-message").replaceWith("…<span id=\\"flash_notice\\">…<\\/span>…")``
-    script. Returns the human-readable message (JS-unescaped, whitespace
-    collapsed) or ``None`` if no flash span is present.
+    Rails UJS responses embed HTML inside a JavaScript string. Normal writes
+    replace ``.flash-message``; validation errors from the staff modal instead
+    populate ``#modal-add-user-error``. Decode the embedded markup first, then
+    prefer the explicit ``flash_notice``/``flash_alert`` span and fall back to
+    an ARIA alert container.
     """
-    match = _FLASH_RE.search(body or "")
-    if not match:
-        return None
-    text = match.group(1).replace("\\/", "/").replace('\\"', '"')
-    text = " ".join(text.split())
-    return text or None
+    decoded = (body or "").replace("\\/", "/").replace('\\"', '"')
+    soup = BeautifulSoup(decoded, "html.parser")
+
+    for selector in (
+        "#modal-add-user-error [id^='flash_']",
+        "#modal-edit-user-error [id^='flash_']",
+        ".flash-message [id^='flash_']",
+        "[id^='flash_']",
+    ):
+        node = soup.select_one(selector)
+        if node:
+            text = " ".join(node.get_text(" ", strip=True).split())
+            if text:
+                return text
+
+    for selector in (
+        "#modal-add-user-error [role='alert']",
+        "#modal-edit-user-error [role='alert']",
+        ".flash-message [role='alert']",
+    ):
+        node = soup.select_one(selector)
+        if node:
+            text = " ".join(node.get_text(" ", strip=True).split())
+            if text:
+                return text
+    return None

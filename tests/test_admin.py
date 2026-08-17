@@ -270,6 +270,13 @@ _INVITE_FAIL = (
     '<div role=\\"alert\\" class=\\"alert alert-dismissable alert-danger\\">\\n'
     '<span id=\\"flash_alert\\">Something went wrong.<\\/span>\\n<\\/div>\\n<\\/div>");'
 )
+_STAFF_VALIDATION_FAIL = (
+    '$("#modal-add-user-error").html("\\n<div class=\\"flash-message\\">\\n'
+    '<div role=\\"alert\\" class=\\"alert alert-dismissable alert-danger\\">\\n'
+    '<span id=\\"flash_alert\\">Email is required for staff users.<\\/span>\\n'
+    '<button class=\\"close\\">×<\\/button>\\n'
+    '<\\/div>\\n<\\/div>\\n");'
+)
 
 
 def test_write_succeeded_true_on_success_flash():
@@ -283,6 +290,12 @@ def test_write_succeeded_false_on_danger_flash_even_with_reload():
     assert not admin.write_succeeded(200, "text/javascript; charset=utf-8", body)
 
 
+def test_write_succeeded_false_on_staff_modal_validation_error():
+    assert not admin.write_succeeded(
+        200, "text/javascript; charset=utf-8", _STAFF_VALIDATION_FAIL
+    )
+
+
 def test_parse_flash_message_single_and_bulk():
     assert admin.parse_flash_message(_SINGLE_INVITE_OK) == "Successfully sent invitation email to user."
     assert (
@@ -290,6 +303,7 @@ def test_parse_flash_message_single_and_bulk():
         == "Successfully sent email/text to 2 unregistered out of 2 selected users"
     )
     assert admin.parse_flash_message(_INVITE_FAIL) == "Something went wrong."
+    assert admin.parse_flash_message(_STAFF_VALIDATION_FAIL) == "Email is required for staff users."
     assert admin.parse_flash_message("$('#page_loading').show();") is None
 
 
