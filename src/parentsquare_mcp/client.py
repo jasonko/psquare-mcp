@@ -29,6 +29,7 @@ class PSClient:
     session: requests.Session = field(default_factory=requests.Session)
     mfa_state: MFAState | None = None
     account: AccountInfo = field(default_factory=AccountInfo)
+    _csrf_token: str | None = field(default=None, repr=False)
 
     def _relogin(self) -> None:
         """Load credentials from 1Password and re-authenticate.
@@ -39,6 +40,7 @@ class PSClient:
         from parentsquare_mcp.auth import load_credentials, login
 
         logger.info("Session expired, loading credentials...")
+        self.invalidate_csrf_token()
         email, password = load_credentials()
         login(self.session, email, password)
 
@@ -66,8 +68,26 @@ class PSClient:
         self._save_cookies_if_changed()
         return BeautifulSoup(resp.text, "html.parser")
 
-    def _get_csrf_token(self) -> str:
-        """Fetch a CSRF token from /dashboard. Re-authenticates if needed."""
+    def invalidate_csrf_token(self) -> None:
+        """Drop the cached CSRF token so the next write fetches a fresh one.
+
+        Call this after any out-of-band re-authentication (MFA completion),
+        since a new session invalidates the old token.
+        """
+        self._csrf_token = None
+
+    def _get_csrf_token(self, force_refresh: bool = False) -> str:
+        """Return a CSRF token, fetching one from the dashboard if needed.
+
+        The token is cached for the life of the session: Rails derives it from a
+        per-session secret, so it stays valid across requests even though the
+        ``ps_s`` cookie rotates. Without the cache every single write costs an
+        extra ``GET /``. Callers that see a token rejected should retry once with
+        ``force_refresh=True`` — see ``_with_csrf``.
+        """
+        if self._csrf_token and not force_refresh:
+            return self._csrf_token
+
         page_resp = self.session.get(f"{BASE_URL}/")
         if "/signin" in page_resp.url:
             self._relogin()
@@ -75,20 +95,56 @@ class PSClient:
 
         soup = BeautifulSoup(page_resp.text, "html.parser")
         csrf_meta = soup.find("meta", attrs={"name": "csrf-token"})
-        return csrf_meta["content"] if csrf_meta else ""
+        self._csrf_token = csrf_meta["content"] if csrf_meta else ""
+        return self._csrf_token
+
+    @staticmethod
+    def _is_csrf_rejection(resp: requests.Response) -> bool:
+        """Was this response a rejected/expired CSRF token or dead session?
+
+        Deliberately narrow. A blanket retry on 422 would re-send writes that the
+        server merely found invalid, so 4xx bodies only count when they name the
+        token; an unauthenticated status or a bounce to /signin always counts.
+        A rejected request never took effect, so retrying it is safe.
+        """
+        if "/signin" in resp.url:
+            return True
+        if resp.status_code in (401, 419):
+            return True
+        if resp.status_code in (403, 422):
+            body = (resp.text or "")[:2000].lower()
+            return "authenticity" in body or "csrf" in body
+        return False
+
+    def _with_csrf(self, send) -> requests.Response:
+        """Run ``send(csrf_token)``, retrying once with a fresh token if rejected.
+
+        This is what makes caching safe: a stale token (or a session that died
+        since the token was issued) costs one extra round trip instead of a
+        failed write, and the refresh re-authenticates via ``_get_csrf_token``.
+        """
+        resp = send(self._get_csrf_token())
+        if self._is_csrf_rejection(resp):
+            logger.info("CSRF token rejected, refetching and retrying once")
+            resp = send(self._get_csrf_token(force_refresh=True))
+        return resp
 
     def graphql(self, query: str, variables: dict, operation_name: str) -> dict:
         """Execute a GraphQL query against /graphql."""
-        csrf_token = self._get_csrf_token()
-
-        resp = self.session.post(
-            f"{BASE_URL}/graphql",
-            json={"query": query, "variables": variables, "operationName": operation_name},
-            headers={
-                "Content-Type": "application/json",
-                "X-CSRF-Token": csrf_token,
-                "X-Requested-With": "XMLHttpRequest",
-            },
+        resp = self._with_csrf(
+            lambda csrf_token: self.session.post(
+                f"{BASE_URL}/graphql",
+                json={
+                    "query": query,
+                    "variables": variables,
+                    "operationName": operation_name,
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "X-CSRF-Token": csrf_token,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
         )
         resp.raise_for_status()
         self._save_cookies_if_changed()
@@ -100,17 +156,18 @@ class PSClient:
 
     def post_json(self, path: str, payload: dict) -> dict:
         """POST JSON to an API endpoint. Fetches CSRF token automatically."""
-        csrf_token = self._get_csrf_token()
         url = f"{BASE_URL}{path}"
-        resp = self.session.post(
-            url,
-            json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "X-CSRF-Token": csrf_token,
-                "X-Requested-With": "XMLHttpRequest",
-            },
+        resp = self._with_csrf(
+            lambda csrf_token: self.session.post(
+                url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "X-CSRF-Token": csrf_token,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
         )
         resp.raise_for_status()
         self._save_cookies_if_changed()
@@ -125,18 +182,19 @@ class PSClient:
         token automatically and does NOT raise on 4xx/5xx so callers can surface
         the API's own error payload (see ``parsers.classes.json_write_error``).
         """
-        csrf_token = self._get_csrf_token()
-        resp = self.session.request(
-            method.upper(),
-            f"{BASE_URL}{path}",
-            json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "X-CSRF-Token": csrf_token,
-                "X-Requested-With": "XMLHttpRequest",
-                "Origin": BASE_URL,
-            },
+        resp = self._with_csrf(
+            lambda csrf_token: self.session.request(
+                method.upper(),
+                f"{BASE_URL}{path}",
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "X-CSRF-Token": csrf_token,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": BASE_URL,
+                },
+            )
         )
         self._save_cookies_if_changed()
         return resp
@@ -150,17 +208,18 @@ class PSClient:
         automatically and does NOT raise on 4xx/5xx — callers inspect the
         status/body (see ``write_succeeded``).
         """
-        csrf_token = self._get_csrf_token()
-        resp = self.session.post(
-            f"{BASE_URL}{path}",
-            json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "X-CSRF-Token": csrf_token,
-                "X-Requested-With": "XMLHttpRequest",
-                "Origin": BASE_URL,
-            },
+        resp = self._with_csrf(
+            lambda csrf_token: self.session.post(
+                f"{BASE_URL}{path}",
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "X-CSRF-Token": csrf_token,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": BASE_URL,
+                },
+            )
         )
         self._save_cookies_if_changed()
         return resp
@@ -174,19 +233,19 @@ class PSClient:
         JSON). Does NOT raise on 4xx/5xx so callers can inspect the body; use the
         status code and body to detect success.
         """
-        csrf_token = self._get_csrf_token()
-        body = {"utf8": "\u2713", "authenticity_token": csrf_token, **data}
-        resp = self.session.post(
-            f"{BASE_URL}{path}",
-            data=body,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Accept": "*/*;q=0.5, text/javascript, application/javascript, "
-                "application/ecmascript, application/x-ecmascript",
-                "X-CSRF-Token": csrf_token,
-                "X-Requested-With": "XMLHttpRequest",
-                "Origin": BASE_URL,
-            },
+        resp = self._with_csrf(
+            lambda csrf_token: self.session.post(
+                f"{BASE_URL}{path}",
+                data={"utf8": "\u2713", "authenticity_token": csrf_token, **data},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Accept": "*/*;q=0.5, text/javascript, application/javascript, "
+                    "application/ecmascript, application/x-ecmascript",
+                    "X-CSRF-Token": csrf_token,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": BASE_URL,
+                },
+            )
         )
         self._save_cookies_if_changed()
         return resp

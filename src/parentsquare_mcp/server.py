@@ -176,6 +176,7 @@ def submit_mfa_code(code: str, context: Context[Any, Any] = None) -> str:
         submit_mfa(app.client.session, app.mfa_state, code)
         app.mfa_state = None
         app.client.mfa_state = None
+        app.client.invalidate_csrf_token()
         return "✅ MFA verification successful! You can now use all ParentSquare tools."
     except Exception as e:
         return f"MFA verification failed: {e}"
@@ -202,6 +203,7 @@ async def _handle_mfa(app: AppContext, exc: MFARequiredError, ctx: Context[Any, 
             submit_mfa(app.client.session, exc.mfa_state, code)
             app.mfa_state = None
             app.client.mfa_state = None
+            app.client.invalidate_csrf_token()
             return ""  # empty string signals success — caller should retry
         elif result.action == "decline":
             return "MFA verification declined. Use submit_mfa_code tool later to complete login."
