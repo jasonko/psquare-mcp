@@ -48,9 +48,11 @@ from parentsquare_mcp.parsers.classes import (
     build_add_class_body,
     build_add_staff_body,
     build_edit_class_body,
+    build_edit_staff_body,
     build_staff_replace_body,
     build_visibility_body,
     default_class_title,
+    extract_staff_edit_fields,
     json_write_error,
     json_write_ok,
     normalize_role,
@@ -2195,6 +2197,106 @@ async def add_staff(
             f" ⚠️ Could not assign class(es) {', '.join(failed)} — retry with add_class_staff."
         )
     return detail
+
+
+@mcp.tool(name="edit_staff")
+@_write_gated
+async def edit_staff(
+    school_id: int,
+    user_id: int,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    email: str | None = None,
+    phone: str | None = None,
+    title: str | None = None,
+    staff_id: str | None = None,
+    context: Context[Any, Any] = None,
+) -> str:
+    """Update a staff member's name, email, phone, title, or staff ID. Requires PS_ENABLE_WRITES.
+
+    Only provided fields change; everything else — including their class
+    assignments and STAFF/ADMIN access level — is left untouched. Get the
+    user_id from list_staff(school_id). To change which classes they teach, use
+    add_class_staff / remove_class_staff instead. Guardians are rejected: use
+    edit_parent for those.
+
+    Args:
+        school_id: School ID
+        user_id: Staff member's user ID (from list_staff)
+        first_name: New first name (optional)
+        last_name: New last name (optional)
+        email: New email (optional)
+        phone: New phone (optional)
+        title: New title shown at the school, e.g. "3rd Grade Teacher" (optional)
+        staff_id: The school's own staff/external ID (optional)
+    """
+    app = _app(context)
+    args = {"school_id": school_id, "user_id": user_id, "first_name": first_name,
+            "last_name": last_name, "email": email, "phone": phone, "title": title,
+            "staff_id": staff_id}
+
+    def _load():
+        try:
+            account_role = (
+                app.client.get_json(f"/api/v2/schools/{school_id}/users/{user_id}")
+                .get("data", {}).get("attributes", {}).get("role") or ""
+            )
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status in (403, 404):
+                return {"not_found": True}
+            raise
+        fields = extract_staff_edit_fields(
+            app.client.get_text(
+                f"/schools/{school_id}/users/{user_id}/edit_institute_user",
+                params={"role": "STAFF"},
+            )
+        )
+        fields["account_role"] = account_role.upper()
+        return fields
+
+    current, err = await _with_mfa_retry(app, context, _load)
+    if err:
+        return err
+    if current.get("not_found"):
+        return f"❌ No user {user_id} at school {school_id}. Get the user_id from list_staff."
+    if current.get("account_role") == "PARENT":
+        return (
+            f"❌ User {user_id} is a guardian, not a staff member. Use edit_parent instead "
+            "(editing them as staff would create conflicting roles)."
+        )
+    if not current.get("first_name") and not current.get("last_name"):
+        return f"❌ Could not load staff member {user_id} (not found or no edit access)."
+    if not current.get("sua_id"):
+        return (
+            f"❌ Could not resolve the school record for staff member {user_id}; "
+            "refusing the edit to avoid clearing their title and school access."
+        )
+    if (email is not None or phone is not None) and not current.get("contact_id"):
+        return f"❌ Could not resolve contact record for staff member {user_id}; cannot update email/phone."
+    if staff_id is not None and not current.get("staff_contact_id"):
+        return f"❌ Could not resolve the staff ID field for staff member {user_id}."
+
+    body = build_edit_staff_body(
+        school_id=school_id,
+        first_name=first_name if first_name is not None else current["first_name"],
+        last_name=last_name if last_name is not None else current["last_name"],
+        contact_id=current.get("contact_id", ""),
+        sua_id=current["sua_id"],
+        school_title=title if title is not None else current.get("school_title", ""),
+        staff_contact_id=current.get("staff_contact_id", ""),
+        staff_external_id=staff_id,
+        email=email,
+        phone=phone,
+        role="ADMIN" if current.get("account_role") == "ADMIN" else "STAFF",
+    )
+    resp, err = await _with_mfa_retry(
+        app, context,
+        lambda: app.client.post_form(f"/schools/{school_id}/users/{user_id}/update_institute_user", body),
+    )
+    if err:
+        return err
+    return _write_result("edit_staff", args, resp)
 
 
 @mcp.tool(name="add_class_staff")

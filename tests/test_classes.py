@@ -179,6 +179,126 @@ def test_build_add_staff_body_admin_role_and_no_sections():
     assert "invited_school_section_ids[]" not in b
 
 
+# --- edit_staff --------------------------------------------------------------
+
+# Trimmed from a live GET /schools/13749/users/15498485/edit_institute_user?role=STAFF
+# (a staff member with both an email and a phone, plus a staff ID field).
+STAFF_EDIT_JS = r"""$('#edit-user-modal-container').html("<form action=\"/schools/13749/users/15498485/update_institute_user\">
+<input type=\"hidden\" name=\"_method\" value=\"patch\" />
+<input placeholder=\"First Name\" type=\"text\" value=\"Emily\" name=\"user[first_name]\" />
+<input placeholder=\"Last Name\" type=\"text\" value=\"Day\" name=\"user[last_name]\" />
+<input value=\"emidoan@gmail.com\" data-original=\"emidoan@gmail.com\" type=\"text\" name=\"user[contacts_attributes][0][email]\" />
+<input type=\"hidden\" value=\"17935545\" name=\"user[contacts_attributes][0][id]\" />
+<input disabled=\"disabled\" type=\"text\" name=\"user[contacts_attributes][1][email]\" />
+<input value=\"415-734-6804\" type=\"text\" name=\"user[contacts_attributes][2][phone]\" />
+<input type=\"hidden\" value=\"17935545\" name=\"user[contacts_attributes][2][id]\" />
+<input type=\"hidden\" name=\"role\" value=\"STAFF\" />
+<input value=\"Reading Specialist\" type=\"text\" name=\"user[school_user_associations_attributes][0][school_title]\" />
+<input value=\"13749\" type=\"hidden\" name=\"user[school_user_associations_attributes][0][school_id]\" />
+<input type=\"hidden\" value=\"34661746\" name=\"user[school_user_associations_attributes][0][id]\" />
+<input type=\"text\" name=\"staff_contacts[manual][17935545][external_id]\" value=\"5007\" />
+<input type=\"hidden\" name=\"staff_contacts[manual][17935545][id]\" value=\"17935545\" />
+<select name=\"invited_school_section_ids[]\" multiple=\"multiple\"><option value=\"50234079\">Room 1<\/option><\/select>
+<\/form>");"""
+
+
+def test_extract_staff_edit_fields_reads_the_live_form():
+    f = classes.extract_staff_edit_fields(STAFF_EDIT_JS)
+    assert f == {
+        "first_name": "Emily",
+        "last_name": "Day",
+        "contact_id": "17935545",
+        "sua_id": "34661746",
+        "school_id": "13749",
+        "school_title": "Reading Specialist",
+        "staff_contact_id": "17935545",
+        "staff_external_id": "5007",
+    }
+
+
+def test_extract_staff_edit_fields_ignores_class_assignments():
+    # The select lists every class but marks none selected, so echoing it back
+    # would blank the staff member's assignments (same trap as student sections).
+    assert "invited_school_section_ids" not in "".join(
+        classes.extract_staff_edit_fields(STAFF_EDIT_JS)
+    )
+
+
+def test_build_edit_staff_body_preserves_title_and_school_association():
+    b = classes.build_edit_staff_body(
+        school_id=13749, first_name="Emily", last_name="Day", contact_id="17935545",
+        sua_id="34661746", school_title="Reading Specialist", staff_contact_id="17935545",
+    )
+    assert b["_method"] == "patch"
+    assert b["role"] == "STAFF"
+    assert b["user[school_user_associations_attributes][0][id]"] == "34661746"
+    assert b["user[school_user_associations_attributes][0][school_id]"] == "13749"
+    assert b["user[school_user_associations_attributes][0][school_title]"] == "Reading Specialist"
+    assert b["commit"] == "Save"
+
+
+def test_build_edit_staff_body_omits_untouched_contact_and_class_fields():
+    b = classes.build_edit_staff_body(
+        school_id=13749, first_name="Emily", last_name="Day", contact_id="17935545",
+        sua_id="34661746", school_title="Reading Specialist", staff_contact_id="17935545",
+    )
+    assert not [k for k in b if "contacts_attributes" in k]
+    assert not [k for k in b if k.startswith("staff_contacts")]
+    assert "invited_school_section_ids[]" not in b
+
+
+def test_build_edit_staff_body_shares_one_contact_id_across_email_and_phone():
+    b = classes.build_edit_staff_body(
+        school_id=13749, first_name="Emily", last_name="Day", contact_id="17935545",
+        sua_id="34661746", school_title="Admin", staff_contact_id="17935545",
+        email="new@example.com", phone="415-555-0000",
+    )
+    assert b["user[contacts_attributes][0][email]"] == "new@example.com"
+    assert b["user[contacts_attributes][0][id]"] == "17935545"
+    assert b["user[contacts_attributes][2][phone]"] == "415-555-0000"
+    assert b["user[contacts_attributes][2][id]"] == "17935545"
+
+
+def test_build_edit_staff_body_can_clear_email_but_not_by_omission():
+    b = classes.build_edit_staff_body(
+        school_id=13749, first_name="E", last_name="D", contact_id="17935545",
+        sua_id="34661746", school_title="Admin", email="",
+    )
+    assert b["user[contacts_attributes][0][email]"] == ""
+
+
+def test_build_edit_staff_body_sets_staff_external_id():
+    b = classes.build_edit_staff_body(
+        school_id=13749, first_name="E", last_name="D", contact_id="17935545",
+        sua_id="34661746", school_title="Admin", staff_contact_id="17935545",
+        staff_external_id="5007",
+    )
+    assert b["staff_contacts[manual][17935545][external_id]"] == "5007"
+    assert b["staff_contacts[manual][17935545][id]"] == "17935545"
+
+
+def test_build_edit_staff_body_skips_staff_id_without_a_contact_record():
+    b = classes.build_edit_staff_body(
+        school_id=13749, first_name="E", last_name="D", contact_id="",
+        sua_id="34661746", school_title="Admin", staff_external_id="5007",
+    )
+    assert not [k for k in b if k.startswith("staff_contacts")]
+
+
+def test_build_edit_staff_body_carries_the_users_actual_role():
+    # Sending a role that conflicts with the existing school_user_association is
+    # rejected by Rails ("This would create conflicting roles").
+    b = classes.build_edit_staff_body(
+        school_id=13749, first_name="X", last_name="Admin", contact_id="",
+        sua_id="4624", school_title="Admin", role="ADMIN",
+    )
+    assert b["role"] == "ADMIN"
+    assert classes.build_edit_staff_body(
+        school_id=13749, first_name="E", last_name="D", contact_id="", sua_id="1",
+        school_title="",
+    )["role"] == "STAFF"
+
+
 def test_build_visibility_body_defaults_to_a_dated_change():
     b = classes.build_visibility_body(13749, [1, 2], visible=True, date="2026-08-17")
     assert b == {"ids": "1,2", "school_id": 13749, "visibility_start_date": "2026-08-17"}

@@ -20,6 +20,7 @@ import json
 import re
 
 from parentsquare_mcp.models import ClassDetail, ClassStaff, RosterStaff, SchoolClass
+from parentsquare_mcp.parsers.admin import _parse_input_tags, _unescape_js
 
 # Roles a section_staff_association can carry (from ParentSquare's own admin JS).
 STAFF_ROLES = ("TEACHER", "ASSISTANT", "ROOM_PARENT")
@@ -157,6 +158,50 @@ def parse_roster_staff(rows: list) -> list[RosterStaff]:
     return staff
 
 
+def extract_staff_edit_fields(js_text: str) -> dict[str, str]:
+    """Extract current staff field values from the ``edit_institute_user`` JS.
+
+    The staff modal is the same Rails form as the guardian one plus two
+    staff-only surfaces: the school_user_association (which carries the job
+    title and must be echoed back by id) and a ``staff_contacts[manual][…]``
+    hash holding the school's own staff/external ID.
+
+    Returns keys: first_name, last_name, contact_id, sua_id, school_id,
+    school_title, staff_contact_id, staff_external_id ("" when absent).
+
+    ``invited_school_section_ids[]`` is deliberately **not** returned. Like the
+    student form's ``section_ids``, the select is rendered with every class but
+    never marks the staff member's own classes ``selected``, so echoing it back
+    would send an empty full-replace list.
+    """
+    html = _unescape_js(js_text)
+    fields = {
+        "first_name": "", "last_name": "", "contact_id": "", "sua_id": "",
+        "school_id": "", "school_title": "", "staff_contact_id": "", "staff_external_id": "",
+    }
+    sua = r"user\[school_user_associations_attributes\]\[0\]"
+    for attrs in _parse_input_tags(html):
+        name, value = attrs.get("name", ""), attrs.get("value", "")
+        if name == "user[first_name]":
+            fields["first_name"] = value
+        elif name == "user[last_name]":
+            fields["last_name"] = value
+        elif re.fullmatch(r"user\[contacts_attributes\]\[\d+\]\[id\]", name) and not fields["contact_id"]:
+            fields["contact_id"] = value
+        elif re.fullmatch(sua + r"\[id\]", name):
+            fields["sua_id"] = value
+        elif re.fullmatch(sua + r"\[school_id\]", name):
+            fields["school_id"] = value
+        elif re.fullmatch(sua + r"\[school_title\]", name):
+            fields["school_title"] = value
+        else:
+            m = re.fullmatch(r"staff_contacts\[manual\]\[(\d+)\]\[external_id\]", name)
+            if m:
+                fields["staff_contact_id"] = m.group(1)
+                fields["staff_external_id"] = value
+    return fields
+
+
 # --- write bodies ------------------------------------------------------------
 
 def build_add_class_body(school_id: int, name: str, grade_ids: list[str]) -> dict:
@@ -251,6 +296,61 @@ def build_add_staff_body(
     }
     if section_ids:
         body["invited_school_section_ids[]"] = [str(s) for s in section_ids]  # type: ignore[assignment]
+    return body
+
+
+def build_edit_staff_body(
+    school_id: int,
+    first_name: str,
+    last_name: str,
+    contact_id: str,
+    sua_id: str,
+    school_title: str,
+    staff_contact_id: str = "",
+    staff_external_id: str | None = None,
+    email: str | None = None,
+    phone: str | None = None,
+    role: str = "STAFF",
+) -> dict:
+    """Body for ``POST /schools/{school_id}/users/{user_id}/update_institute_user``.
+
+    Rails method-override PATCH, same endpoint as ``edit_parent``. The top-level
+    ``role`` tells Rails which roster the user is being edited as; it does not
+    grant or revoke access on its own (the form renders identically for
+    ``?role=STAFF`` and ``?role=ADMIN``), but sending a role that conflicts with
+    the user's existing school_user_association is rejected with "Cannot update
+    user: This would create conflicting roles" — so callers pass the user's
+    actual role and always echo ``sua_id`` back.
+
+    Email and phone share one contact record addressed at indices ``[0]``
+    (email) and ``[2]`` (phone) with the same contact id, exactly as for
+    guardians. The school_user_association must be echoed back with its id or
+    the job title is lost, so callers pass the current title through unchanged.
+
+    ``invited_school_section_ids[]`` is never sent — it is a full-replace field
+    whose current value cannot be read back from the form, so including it would
+    wipe the staff member's class assignments (verified live: omitting it leaves
+    them intact). Use add_class_staff / remove_class_staff for those.
+    """
+    body: dict = {
+        "_method": "patch",
+        "role": role,
+        "user[first_name]": first_name,
+        "user[last_name]": last_name,
+        "user[school_user_associations_attributes][0][school_id]": str(school_id),
+        "user[school_user_associations_attributes][0][id]": sua_id,
+        "user[school_user_associations_attributes][0][school_title]": school_title,
+        "commit": "Save",
+    }
+    if email is not None:
+        body["user[contacts_attributes][0][email]"] = email
+        body["user[contacts_attributes][0][id]"] = contact_id
+    if phone is not None:
+        body["user[contacts_attributes][2][phone]"] = phone
+        body["user[contacts_attributes][2][id]"] = contact_id
+    if staff_external_id is not None and staff_contact_id:
+        body[f"staff_contacts[manual][{staff_contact_id}][external_id]"] = staff_external_id
+        body[f"staff_contacts[manual][{staff_contact_id}][id]"] = staff_contact_id
     return body
 
 

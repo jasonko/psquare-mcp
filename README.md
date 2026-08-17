@@ -70,6 +70,19 @@ Read tools are always available; **write tools are disabled by default** and onl
 - **`invite_parent`** *(write)* — Send (or resend) a ParentSquare registration invitation to one guardian
 - **`bulk_invite_parents`** *(write)* — Invite many guardians at once; already-registered guardians are skipped automatically
 
+### Admin (classes, staff & enrollment)
+Same write gate and audit log as above; no deletion of classes or staff.
+- **`list_classes`** / **`get_class`** — A school's classes, and one class with its full staff list (teachers, assistants, room parents)
+- **`add_class`** *(write)* — Create a class; new classes start **hidden** until `set_class_visibility`
+- **`edit_class`** *(write)* — Rename a class or change its grades
+- **`set_class_visibility`** *(write)* — Show or hide classes (date-driven, defaults to today)
+- **`list_staff`** — Staff and admin roster (user_id, name, email, phone, role/title) as structured JSON, with an optional `name_contains` filter; provides the `user_id` needed by `edit_staff` / `add_class_staff`
+- **`add_staff`** *(write)* — Add a teacher, staff member, or admin, optionally assigning them to classes
+- **`edit_staff`** *(write)* — Update a staff member's name, email, phone, title, or staff ID (class assignments and STAFF/ADMIN access preserved; guardians are rejected — use `edit_parent`)
+- **`add_class_staff`** / **`remove_class_staff`** *(write)* — Assign or unassign teachers, assistants, and room parents for a class
+- **`list_class_students`** — The students enrolled in a class
+- **`add_class_students`** / **`remove_class_students`** / **`move_student_to_class`** *(write)* — Manage which students are enrolled in which classes
+
 ### Authentication
 - **`submit_mfa_code`** — Complete MFA verification with a 6-digit code
 - Supports MCP elicitation for inline MFA prompts
