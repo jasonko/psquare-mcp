@@ -115,7 +115,15 @@ def extract_student_edit_fields(js_text: str) -> dict[str, str]:
     """Extract current student field values from the edit-form JS response.
 
     Returns keys: first_name, last_name, external_id, grade_id (as strings;
-    missing values are ""), plus section_ids (list of selected option values).
+    missing values are "").
+
+    Class enrollment is deliberately **not** returned. The form's
+    ``<select name="student[section_ids][]">`` lists the grade's available
+    classes but never marks any option ``selected`` (``data-initval`` is always
+    ``"[]"``) — ParentSquare loads the current enrollment separately via JS. Any
+    value scraped here would be an empty list for every student, and feeding
+    that back into the full-replace ``student[section_ids][]`` field wiped the
+    student's classes. Read classes via ``get_student``'s GraphQL ``sections``.
     """
     html = _unescape_js(js_text)
     fields: dict[str, str] = {"first_name": "", "last_name": "", "external_id": "", "grade_id": ""}
@@ -129,20 +137,6 @@ def extract_student_edit_fields(js_text: str) -> dict[str, str]:
         key = wanted.get(attrs.get("name", ""))
         if key:
             fields[key] = attrs.get("value", "")
-
-    section_ids: list[str] = []
-    select_m = re.search(
-        r'<select\b[^>]*name="student\[section_ids\]\[\]"[^>]*>(.*?)</select>',
-        html,
-        re.DOTALL,
-    )
-    if select_m:
-        for opt in re.findall(r"<option\b[^>]*>", select_m.group(1)):
-            if "selected" in opt:
-                val_m = re.search(r'value="([^"]*)"', opt)
-                if val_m and val_m.group(1):
-                    section_ids.append(val_m.group(1))
-    fields["section_ids"] = section_ids  # type: ignore[assignment]
     return fields
 
 
@@ -220,12 +214,17 @@ def parse_student_profile(data: dict) -> AdminStudentProfile | None:
 # --- form-body builders ------------------------------------------------------
 
 def build_add_student_body(first_name: str, last_name: str, grade_id: int, sis_id: str = "") -> dict:
+    """Body for ``POST /schools/{school_id}/students``.
+
+    ``student[section_ids][]`` is deliberately omitted — see
+    ``build_edit_student_body``. A new student has no classes to preserve, but
+    sending the key serves no purpose either.
+    """
     return {
         "student[first_name]": first_name,
         "student[last_name]": last_name,
         "student[external_id]": sis_id or "",
         "student[grade_id]": str(grade_id),
-        "student[section_ids][]": "",
         "commit": "Add Student",
     }
 
@@ -237,6 +236,24 @@ def build_edit_student_body(
     sis_id: str = "",
     section_ids: list[str] | None = None,
 ) -> dict:
+    """Body for ``POST /schools/{id}/students/{sid}`` (Rails ``_method=patch``).
+
+    ``student[section_ids][]`` is a **full replace**: whatever is sent becomes
+    the student's complete class list, and an empty value clears every class.
+    Omitting the key entirely leaves the existing enrollment untouched — the same
+    way ``build_edit_parent_body`` omits ``kids_attributes``.
+
+    So ``section_ids=None`` (the default) omits the key and preserves the
+    student's classes. Pass an explicit list only to *replace* the enrollment;
+    an explicit ``[]`` clears it.
+
+    This must not be derived from the edit form: that form renders the grade's
+    available classes but never marks any ``<option>`` as ``selected`` (its
+    ``data-initval`` is always ``"[]"``), because the current enrollment is
+    loaded separately by JS. Scraping it yields ``[]`` for every student, which
+    previously made every edit silently unenroll the student from all classes.
+    Use ``get_student``'s GraphQL ``sections`` to read current classes.
+    """
     body = {
         "_method": "patch",
         "student[first_name]": first_name,
@@ -245,12 +262,9 @@ def build_edit_student_body(
         "student[grade_id]": str(grade_id),
         "commit": "Save",
     }
-    section_ids = section_ids or []
-    if section_ids:
+    if section_ids is not None:
         # requests encodes list values as repeated keys
-        body["student[section_ids][]"] = section_ids  # type: ignore[assignment]
-    else:
-        body["student[section_ids][]"] = ""
+        body["student[section_ids][]"] = section_ids or ""  # type: ignore[assignment]
     return body
 
 

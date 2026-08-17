@@ -80,7 +80,18 @@ def test_extract_student_edit_fields():
     assert f["last_name"] == "Doe"
     assert f["external_id"] == ""
     assert f["grade_id"] == "545988"
-    assert f["section_ids"] == []
+
+
+def test_extract_student_edit_fields_never_reports_sections():
+    """The edit form never marks a section <option> selected, so any scraped
+    value would be a false empty list that wipes the student's classes."""
+    js = STUDENT_EDIT_JS.replace(
+        r"..\")",
+        r'<select name=\"student[section_ids][]\" data-initval=\"[]\">'
+        r"<option value=\"\">Select Class</option>"
+        r'<option value=\"5258167\">Mr. Heiko Class</option></select> ..")',
+    )
+    assert "section_ids" not in admin.extract_student_edit_fields(js)
 
 
 PARENT_EDIT_JS = (
@@ -135,6 +146,7 @@ def test_build_add_student_body():
     assert b["student[grade_id]"] == "545988"
     assert b["student[external_id]"] == "SIS-1"
     assert b["commit"] == "Add Student"
+    assert "student[section_ids][]" not in b
 
 
 def test_build_edit_student_body_uses_patch():
@@ -142,6 +154,23 @@ def test_build_edit_student_body_uses_patch():
     assert b["_method"] == "patch"
     assert b["student[external_id]"] == "SIS-9"
     assert b["commit"] == "Save"
+
+
+def test_build_edit_student_body_omits_sections_by_default():
+    """Regression: sending student[section_ids][] is a full replace, so an edit
+    that isn't changing enrollment must omit the key or it wipes every class."""
+    b = admin.build_edit_student_body("Jane", "Doe", "545988", "SIS-9")
+    assert "student[section_ids][]" not in b
+
+
+def test_build_edit_student_body_replaces_sections_when_given():
+    b = admin.build_edit_student_body("Jane", "Doe", "545988", section_ids=["1", "2"])
+    assert b["student[section_ids][]"] == ["1", "2"]
+
+
+def test_build_edit_student_body_explicit_empty_list_clears():
+    b = admin.build_edit_student_body("Jane", "Doe", "545988", section_ids=[])
+    assert b["student[section_ids][]"] == ""
 
 
 def test_build_edit_parent_body_omits_kids_and_shares_contact_id():

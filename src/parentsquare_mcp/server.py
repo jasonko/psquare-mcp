@@ -1500,8 +1500,9 @@ async def edit_student(
 ) -> str:
     """Update an existing student. Only provided fields change. Requires PS_ENABLE_WRITES.
 
-    Current values (name, SIS id, grade, classes) are read from the edit form and
-    preserved for any field you don't pass.
+    Current values (name, SIS id, grade) are read from the edit form and
+    preserved for any field you don't pass. Class enrollment is never touched —
+    use add_class_students / remove_class_students / move_student_to_class.
 
     Args:
         school_id: School ID
@@ -1538,7 +1539,6 @@ async def edit_student(
         last_name=last_name if last_name is not None else current["last_name"],
         grade_id=resolved_grade_id,
         sis_id=student_sis_id if student_sis_id is not None else current["external_id"],
-        section_ids=current.get("section_ids") or [],
     )
     resp, err = await _with_mfa_retry(
         app, context, lambda: app.client.post_form(f"/schools/{school_id}/students/{student_id}", body)
