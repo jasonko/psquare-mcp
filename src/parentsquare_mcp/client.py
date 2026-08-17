@@ -116,6 +116,31 @@ class PSClient:
         self._save_cookies_if_changed()
         return resp.json()
 
+    def send_json(self, method: str, path: str, payload: dict) -> requests.Response:
+        """Send a JSON body with an arbitrary verb and return the raw Response.
+
+        Used by the JSON:API class/section admin endpoints, which take PATCH and
+        PUT (e.g. ``PATCH /api/v2/sections/{id}``, ``PUT /api/v2/sections/{id}/staff``)
+        and answer with real JSON rather than a Rails UJS script. Fetches the CSRF
+        token automatically and does NOT raise on 4xx/5xx so callers can surface
+        the API's own error payload (see ``parsers.classes.json_write_error``).
+        """
+        csrf_token = self._get_csrf_token()
+        resp = self.session.request(
+            method.upper(),
+            f"{BASE_URL}{path}",
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-CSRF-Token": csrf_token,
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": BASE_URL,
+            },
+        )
+        self._save_cookies_if_changed()
+        return resp
+
     def post_json_raw(self, path: str, payload: dict) -> requests.Response:
         """POST a JSON body but return the raw Response (not parsed JSON).
 
@@ -181,17 +206,21 @@ class PSClient:
         self._save_cookies_if_changed()
         return resp.text
 
-    def get_json(self, path: str) -> dict:
+    def get_json(self, path: str, params: dict | None = None) -> dict:
         """GET a JSON API endpoint and return parsed response.
 
         Automatically re-authenticates if redirected to /signin.
         """
         url = f"{BASE_URL}{path}"
-        resp = self.session.get(url, headers={"Accept": "application/json"})
+        # Accept must stay JSON-only: the Rails roster feeds (e.g.
+        # /schools/{id}/roster/parents_data) 404 if text/javascript is offered,
+        # because respond_to then picks the JS format, which has no template.
+        headers = {"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"}
+        resp = self.session.get(url, params=params, headers=headers)
 
         if "/signin" in resp.url:
             self._relogin()
-            resp = self.session.get(url, headers={"Accept": "application/json"})
+            resp = self.session.get(url, params=params, headers=headers)
 
         resp.raise_for_status()
         self._save_cookies_if_changed()

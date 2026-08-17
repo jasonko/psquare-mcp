@@ -244,3 +244,68 @@ class AdminStudentProfile:
     student_sis_id: str | None = None   # externalId
     parents: list[dict] = field(default_factory=list)   # {name, profile_path}
     sections: list[dict] = field(default_factory=list)   # {name, period, room, teachers}
+
+
+@dataclass
+class SchoolClass:
+    """A class/section summary row from the ``sections_mini`` admin feed."""
+
+    id: int
+    name: str
+    grade_names: str = ""
+    grade_ids: str = ""            # comma-joined grade ids
+    external_id: str = ""          # room code, e.g. "Room 5"
+    display_name: str | None = None
+    sis_name: str | None = None
+    teachers: str = ""             # comma-joined teacher names
+    assistants: int = 0
+    room_parents: int = 0
+    student_count: int = 0
+    posts_count: int = 0
+    visibility_status: str = ""    # section_class_status, e.g. "visible_to_all" / "hidden"
+
+
+@dataclass
+class ClassStaff:
+    """One ``section_staff_association`` — a staff member or room parent on a class."""
+
+    assoc_id: int | None          # section_staff_association id (None for a new link)
+    user_id: int
+    role: str                     # TEACHER | ASSISTANT | ROOM_PARENT
+    class_title: str = ""
+    first_name: str = ""
+    last_name: str = ""
+
+    @property
+    def name(self) -> str:
+        return f"{self.first_name} {self.last_name}".strip()
+
+
+@dataclass
+class ClassDetail:
+    """A class plus its full staff list, from ``/api/v2/sections/{id}?include_staff=true``."""
+
+    id: int
+    name: str
+    external_id: str = ""
+    display_name: str | None = None
+    sis_name: str | None = None
+    active: bool = True
+    grade_ids: list[str] = field(default_factory=list)
+    staff: list[ClassStaff] = field(default_factory=list)
+
+
+@dataclass
+class RosterStaff:
+    """A staff member row from the ``staff_data`` admin feed."""
+
+    user_id: int
+    name: str                     # "Last, First"
+    email: str | None = None
+    phone: str | None = None
+    secondary_phone: str | None = None
+    staff_id: str = ""
+    role_title: str = ""          # "Role | Title", HTML stripped
+    registered: bool = False
+    record_created: str = ""
+    sua_id: int | None = None     # school_user_association id

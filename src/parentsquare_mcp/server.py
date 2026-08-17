@@ -9,6 +9,7 @@ import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import date as date_cls
 from pathlib import Path
 from typing import Any
 
@@ -43,9 +44,23 @@ from parentsquare_mcp.parsers.admin import (
     write_succeeded,
 )
 from parentsquare_mcp.parsers.calendar import parse_ics_calendar
+from parentsquare_mcp.parsers.classes import (
+    build_add_class_body,
+    build_add_staff_body,
+    build_edit_class_body,
+    build_staff_replace_body,
+    build_visibility_body,
+    default_class_title,
+    json_write_error,
+    json_write_ok,
+    normalize_role,
+    parse_roster_staff,
+    parse_section_detail,
+    parse_sections_mini,
+)
 
 from parentsquare_mcp.parsers.feeds import parse_feed_page, parse_post_detail
-from parentsquare_mcp.models import Group
+from parentsquare_mcp.models import ClassStaff, Group
 from parentsquare_mcp.parsers.groups import parse_group_feed
 from parentsquare_mcp.parsers.links import parse_links_page
 from parentsquare_mcp.parsers.notices import parse_notices
@@ -1738,6 +1753,574 @@ async def bulk_invite_parents(
     if err:
         return err
     return _write_result("bulk_invite_parents", args, resp)
+
+
+# ---------------------------------------------------------------------------
+# Admin: classes (sections) and staff
+# ---------------------------------------------------------------------------
+
+
+def _sections_mini(client: PSClient, school_id: int):
+    """Fetch and parse the full class list for a school (one call)."""
+    data = client.get_json(f"/api/v2/schools/{school_id}/sections_mini")
+    return parse_sections_mini(data.get("data", []))
+
+
+def _section_detail(client: PSClient, section_id: int):
+    """Fetch and parse one class plus its staff associations."""
+    payload = client.get_json(f"/api/v2/sections/{section_id}", params={"include_staff": "true"})
+    return parse_section_detail(payload)
+
+
+def _class_dict(c) -> dict:
+    return {
+        "section_id": c.id,
+        "name": c.name,
+        "grades": c.grade_names,
+        "grade_ids": [g for g in c.grade_ids.split(",") if g],
+        "room": c.external_id,
+        "teachers": c.teachers,
+        "assistant_count": c.assistants,
+        "room_parent_count": c.room_parents,
+        "student_count": c.student_count,
+        "visibility": c.visibility_status,
+    }
+
+
+def _staff_dict(s) -> dict:
+    return {
+        "assoc_id": s.assoc_id,
+        "user_id": s.user_id,
+        "name": s.name,
+        "role": s.role,
+        "class_title": s.class_title,
+    }
+
+
+def _json_write_result(tool: str, args: dict, resp) -> str:
+    """Interpret a JSON:API write Response, audit it, and format a user message.
+
+    The class/section endpoints answer with real JSON (2xx on success), so the
+    UJS-oriented ``write_succeeded`` / flash parsing used by the student and
+    guardian tools does not apply here.
+    """
+    ok = json_write_ok(resp.status_code)
+    if ok:
+        audit_write(tool, args, True, detail=f"HTTP {resp.status_code}")
+        return "✅ Success."
+    detail = json_write_error(resp.status_code, resp.text)
+    audit_write(tool, args, False, detail=detail)
+    return f"❌ Operation failed ({detail})"
+
+
+async def _load_class(app, context, section_id: int):
+    """Read a class + staff for a read-modify-write. -> (ClassDetail|None, err)."""
+    detail, err = await _with_mfa_retry(app, context, lambda: _section_detail(app.client, section_id))
+    if err:
+        return None, err
+    if not detail:
+        return None, f"❌ No class found with section_id {section_id}."
+    return detail, None
+
+
+async def _put_class_staff(app, context, tool: str, args: dict, section_id: int, staff: list):
+    """PUT the full staff list for a class (the endpoint replaces, never merges)."""
+    body = build_staff_replace_body(staff)
+    resp, err = await _with_mfa_retry(
+        app, context, lambda: app.client.send_json("PUT", f"/api/v2/sections/{section_id}/staff", body)
+    )
+    if err:
+        return err
+    return _json_write_result(tool, args, resp)
+
+
+async def _find_new_staff_id(app, context, school_id: int, first_name: str, last_name: str,
+                             email: str | None):
+    """Look up a just-created staff member's user_id. -> (user_id|None, reason)."""
+
+    def _fetch():
+        data = app.client.get_json(f"/schools/{school_id}/roster/staff_data")
+        return parse_roster_staff(data.get("data", []))
+
+    staff, err = await _with_mfa_retry(app, context, _fetch)
+    if err:
+        return None, "the staff roster could not be read."
+    if email:
+        matches = [s for s in staff if (s.email or "").lower() == email.lower()]
+        if len(matches) == 1:
+            return matches[0].user_id, ""
+    wanted = f"{last_name}, {first_name}".lower()
+    matches = [s for s in staff if s.name.lower() == wanted]
+    if len(matches) == 1:
+        return matches[0].user_id, ""
+    if not matches:
+        return None, "they could not be found in the staff roster."
+    return None, f"{len(matches)} staff members share that name, so the right one is ambiguous."
+
+
+@mcp.tool(name="list_classes")
+async def list_classes(
+    school_id: int,
+    name_contains: str | None = None,
+    grade: str | None = None,
+    context: Context[Any, Any] = None,
+) -> dict | str:
+    """List a school's classes (sections) with grades, teachers, and room-parent counts.
+
+    Returns every class in one call. Use the `section_id` from results with
+    get_class, edit_class, add_class_staff, remove_class_staff, and
+    set_class_visibility.
+
+    Args:
+        school_id: School ID (from list_schools)
+        name_contains: Optional case-insensitive substring filter on class name
+        grade: Optional case-insensitive filter on grade name (e.g. "Kindergarten")
+    """
+    app = _app(context)
+    classes, err = await _with_mfa_retry(app, context, lambda: _sections_mini(app.client, school_id))
+    if err:
+        return err
+    if name_contains:
+        n = name_contains.lower()
+        classes = [c for c in classes if n in c.name.lower()]
+    if grade:
+        g = grade.lower()
+        classes = [c for c in classes if g in c.grade_names.lower()]
+    return {
+        "school": _school_name(app, school_id),
+        "count": len(classes),
+        "classes": [_class_dict(c) for c in classes],
+    }
+
+
+@mcp.tool(name="get_class")
+async def get_class(section_id: int, context: Context[Any, Any] = None) -> dict | str:
+    """Get one class with its full staff list (teachers, assistants, room parents).
+
+    Each staff entry includes the `user_id` (the person) and `assoc_id` (their
+    link to this class). Use this before changing staff to see the current state.
+
+    Args:
+        section_id: Class/section ID (from list_classes)
+    """
+    app = _app(context)
+    detail, err = await _load_class(app, context, section_id)
+    if err:
+        return err
+    return {
+        "section_id": detail.id,
+        "name": detail.name,
+        "room": detail.external_id,
+        "grade_ids": detail.grade_ids,
+        "active": detail.active,
+        "staff": [_staff_dict(s) for s in detail.staff],
+    }
+
+
+@mcp.tool(name="list_staff")
+async def list_staff(
+    school_id: int,
+    name_contains: str | None = None,
+    context: Context[Any, Any] = None,
+) -> dict | str:
+    """List a school's staff and admins (user_id, name, email, phone, role/title).
+
+    Use the returned `user_id` with add_class_staff to assign a teacher to a class.
+
+    Args:
+        school_id: School ID (from list_schools)
+        name_contains: Optional case-insensitive substring filter on staff name
+    """
+    app = _app(context)
+
+    def _fetch():
+        data = app.client.get_json(f"/schools/{school_id}/roster/staff_data")
+        return parse_roster_staff(data.get("data", []))
+
+    staff, err = await _with_mfa_retry(app, context, _fetch)
+    if err:
+        return err
+    if name_contains:
+        n = name_contains.lower()
+        staff = [s for s in staff if n in s.name.lower()]
+    return {
+        "school": _school_name(app, school_id),
+        "count": len(staff),
+        "staff": [
+            {
+                "user_id": s.user_id,
+                "name": s.name,
+                "email": s.email,
+                "phone": s.phone,
+                "staff_id": s.staff_id,
+                "role_title": s.role_title,
+                "registered": s.registered,
+            }
+            for s in staff
+        ],
+    }
+
+
+@mcp.tool(name="add_class")
+@_write_gated
+async def add_class(
+    school_id: int,
+    name: str,
+    grade_ids: list[int],
+    context: Context[Any, Any] = None,
+) -> str:
+    """Create a new class (section) at a school. Requires PS_ENABLE_WRITES.
+
+    New classes are created **hidden** — they are not visible to staff, parents,
+    or students until you call set_class_visibility. Assign teachers afterwards
+    with add_class_staff.
+
+    Args:
+        school_id: School ID
+        name: Class name (e.g. "Ms. Smith's Class")
+        grade_ids: One or more grade IDs the class belongs to (from list_grades)
+    """
+    app = _app(context)
+    args = {"school_id": school_id, "name": name, "grade_ids": grade_ids}
+    if not name.strip():
+        return "❌ A class name is required."
+    if not grade_ids:
+        return "❌ At least one grade_id is required (see list_grades)."
+    body = build_add_class_body(school_id, name, [str(g) for g in grade_ids])
+    resp, err = await _with_mfa_retry(
+        app, context, lambda: app.client.send_json("POST", f"/api/v2/schools/{school_id}/sections", body)
+    )
+    if err:
+        return err
+    result = _json_write_result("add_class", args, resp)
+    if not result.startswith("✅"):
+        return result
+    try:
+        new_id = resp.json()["data"]["attributes"]["id"]
+    except (ValueError, KeyError, TypeError):
+        return f"{result} Created \"{name}\" (hidden). Find its section_id with list_classes."
+    return (
+        f"✅ Created class \"{name}\" (section_id={new_id}). It is hidden until you "
+        "call set_class_visibility; add teachers with add_class_staff."
+    )
+
+
+@mcp.tool(name="edit_class")
+@_write_gated
+async def edit_class(
+    section_id: int,
+    school_id: int,
+    name: str | None = None,
+    room: str | None = None,
+    grade_ids: list[int] | None = None,
+    context: Context[Any, Any] = None,
+) -> str:
+    """Rename a class or change its room code / grades. Requires PS_ENABLE_WRITES.
+
+    Only provided fields change — current values are read back from the class
+    first and resent, because the underlying endpoint replaces what it is given.
+    Staff are not affected; use add_class_staff / remove_class_staff for those.
+
+    Args:
+        section_id: Class/section ID (from list_classes)
+        school_id: School ID the class belongs to
+        name: New class name (optional)
+        room: New room code / external ID, e.g. "Room 5" (optional)
+        grade_ids: New list of grade IDs (optional; replaces the current grades)
+    """
+    app = _app(context)
+    args = {"section_id": section_id, "school_id": school_id, "name": name,
+            "room": room, "grade_ids": grade_ids}
+    current, err = await _load_class(app, context, section_id)
+    if err:
+        return err
+    resolved_grades = [str(g) for g in grade_ids] if grade_ids is not None else current.grade_ids
+    if not resolved_grades:
+        return (
+            f"❌ Could not determine the current grades for class {section_id}; "
+            "refusing the edit to avoid blanking them. Pass explicit grade_ids "
+            "(see list_grades)."
+        )
+    body = build_edit_class_body(
+        school_id=school_id,
+        section_id=section_id,
+        name=name if name is not None else current.name,
+        external_id=room if room is not None else current.external_id,
+        grade_ids=resolved_grades,
+    )
+    resp, err = await _with_mfa_retry(
+        app, context, lambda: app.client.send_json("PATCH", f"/api/v2/sections/{section_id}", body)
+    )
+    if err:
+        return err
+    return _json_write_result("edit_class", args, resp)
+
+
+@mcp.tool(name="set_class_visibility")
+@_write_gated
+async def set_class_visibility(
+    school_id: int,
+    section_ids: list[int],
+    visible: bool,
+    date: str | None = None,
+    context: Context[Any, Any] = None,
+) -> str:
+    """Show or hide classes for staff, parents, and students. Requires PS_ENABLE_WRITES.
+
+    Newly created classes start hidden, so a class made with add_class needs this
+    before anyone can see or post to it. Hidden classes are not visible to staff,
+    parents, or students.
+
+    Args:
+        school_id: School ID
+        section_ids: Class/section IDs to update (from list_classes)
+        visible: True to make the classes visible, False to hide them
+        date: Optional YYYY-MM-DD date the change takes effect; defaults to today
+    """
+    app = _app(context)
+    args = {"school_id": school_id, "section_ids": section_ids, "visible": visible, "date": date}
+    if not section_ids:
+        return "❌ No section_ids provided — nothing to update."
+    if date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        return f"❌ Invalid date {date!r}. Use YYYY-MM-DD, or omit it to apply today."
+    body = build_visibility_body(
+        school_id, section_ids, visible, date or date_cls.today().isoformat()
+    )
+    resp, err = await _with_mfa_retry(
+        app,
+        context,
+        lambda: app.client.send_json(
+            "PUT", f"/api/v2/schools/{school_id}/sections/bulk_update_class_visibility", body
+        ),
+    )
+    if err:
+        return err
+    return _json_write_result("set_class_visibility", args, resp)
+
+
+@mcp.tool(name="add_staff")
+@_write_gated
+async def add_staff(
+    school_id: int,
+    first_name: str,
+    last_name: str,
+    email: str | None = None,
+    phone: str | None = None,
+    title: str | None = None,
+    staff_id: str | None = None,
+    is_admin: bool = False,
+    section_ids: list[int] | None = None,
+    class_role: str = "TEACHER",
+    context: Context[Any, Any] = None,
+) -> str:
+    """Add a teacher or other staff member to a school. Requires PS_ENABLE_WRITES.
+
+    ParentSquare emails the new account an address-verification/registration
+    invite. Passing section_ids assigns them to those classes right away (as
+    class_role, default TEACHER) — verified live, because ParentSquare's own
+    "invited classes" field does not create the assignment until the person
+    registers, so this tool makes the assignment itself.
+
+    Args:
+        school_id: School ID
+        first_name: Staff member's first name
+        last_name: Staff member's last name
+        email: Email address (optional but needed for them to register)
+        phone: Phone number (optional)
+        title: Title shown at the school, e.g. "3rd Grade Teacher" (optional)
+        staff_id: The school's own staff/external ID (optional)
+        is_admin: True to grant school Admin rather than Staff access
+        section_ids: Class/section IDs to assign them to (from list_classes)
+        class_role: Role for those classes — TEACHER (default) or ASSISTANT
+    """
+    app = _app(context)
+    args = {"school_id": school_id, "first_name": first_name, "last_name": last_name,
+            "email": email, "phone": phone, "title": title, "staff_id": staff_id,
+            "is_admin": is_admin, "section_ids": section_ids, "class_role": class_role}
+    resolved_role = None
+    if section_ids:
+        try:
+            resolved_role = normalize_role(class_role)
+        except ValueError as exc:
+            return f"❌ {exc}"
+    body = build_add_staff_body(
+        school_id=school_id,
+        first_name=first_name,
+        last_name=last_name,
+        email=email or "",
+        phone=phone or "",
+        staff_id=staff_id or "",
+        title=title or "",
+        role="ADMIN" if is_admin else "STAFF",
+        section_ids=section_ids,
+    )
+    resp, err = await _with_mfa_retry(
+        app, context, lambda: app.client.post_form(f"/schools/{school_id}/users", body)
+    )
+    if err:
+        return err
+    result = _write_result("add_staff", args, resp)
+    if not result.startswith("✅"):
+        return result
+    created = f"{result} Added {first_name} {last_name}."
+    if not section_ids:
+        return f"{created} Find their user_id with list_staff."
+
+    user_id, err = await _find_new_staff_id(app, context, school_id, first_name, last_name, email)
+    if not user_id:
+        return (
+            f"{created} ⚠️ But their class assignment could not be completed: {err} "
+            "Find them with list_staff and assign the classes with add_class_staff."
+        )
+    assigned, failed = [], []
+    for section_id in section_ids:
+        outcome = await add_class_staff(
+            section_id, [user_id], resolved_role, context=context
+        )
+        (assigned if outcome.startswith(("✅", "ℹ️")) else failed).append(str(section_id))
+    detail = f"{created} user_id {user_id}."
+    if assigned:
+        detail += f" Assigned as {resolved_role} to class(es) {', '.join(assigned)}."
+    if failed:
+        detail += (
+            f" ⚠️ Could not assign class(es) {', '.join(failed)} — retry with add_class_staff."
+        )
+    return detail
+
+
+@mcp.tool(name="add_class_staff")
+@_write_gated
+async def add_class_staff(
+    section_id: int,
+    user_ids: list[int],
+    role: str,
+    class_title: str | None = None,
+    context: Context[Any, Any] = None,
+) -> str:
+    """Assign teachers, assistants, or room parents to a class. Requires PS_ENABLE_WRITES.
+
+    The class's existing staff are read first and preserved — only the listed
+    people are added, all in a single update. Anyone already holding the role is
+    skipped; anyone on the class under a different role is moved to this one.
+    Room parents are ordinary guardians: get their user_id from list_parents.
+    Teachers and assistants come from list_staff.
+
+    Args:
+        section_id: Class/section ID (from list_classes)
+        user_ids: One or more user IDs (list_staff for staff, list_parents for room parents)
+        role: One of TEACHER, ASSISTANT, ROOM_PARENT — applied to everyone in user_ids
+        class_title: Optional label shown on the class (defaults to the role name)
+    """
+    app = _app(context)
+    args = {
+        "section_id": section_id,
+        "user_ids": user_ids,
+        "role": role,
+        "class_title": class_title,
+    }
+    if not user_ids:
+        return "❌ No user_ids provided — nothing to add."
+    try:
+        resolved_role = normalize_role(role)
+    except ValueError as exc:
+        return f"❌ {exc}"
+    wanted = list(dict.fromkeys(user_ids))
+    current, err = await _load_class(app, context, section_id)
+    if err:
+        return err
+
+    by_user = {s.user_id: s for s in current.staff}
+    already = [u for u in wanted if u in by_user and by_user[u].role == resolved_role]
+    changing = [u for u in wanted if u not in already]
+    if not changing:
+        names = ", ".join(by_user[u].name or str(u) for u in already)
+        return (
+            f"ℹ️ Already {resolved_role} on \"{current.name}\": {names} — no change made."
+        )
+
+    staff = [s for s in current.staff if s.user_id not in changing]
+    for user_id in changing:
+        existing = by_user.get(user_id)
+        staff.append(
+            ClassStaff(
+                assoc_id=existing.assoc_id if existing else None,
+                user_id=user_id,
+                role=resolved_role,
+                class_title=class_title or default_class_title(resolved_role),
+                first_name=existing.first_name if existing else "",
+                last_name=existing.last_name if existing else "",
+            )
+        )
+    result = await _put_class_staff(app, context, "add_class_staff", args, section_id, staff)
+    if result.startswith("✅") and already:
+        skipped = ", ".join(by_user[u].name or str(u) for u in already)
+        return f"{result} ({len(already)} already had the role: {skipped}.)"
+    return result
+
+
+@mcp.tool(name="remove_class_staff")
+@_write_gated
+async def remove_class_staff(
+    section_id: int,
+    user_ids: list[int] | None = None,
+    role: str | None = None,
+    context: Context[Any, Any] = None,
+) -> str:
+    """Remove staff or room parents from a class. Requires PS_ENABLE_WRITES.
+
+    Pass user_ids to remove specific people, role to remove everyone holding that
+    role on the class (e.g. role="ROOM_PARENT" clears that class's room parents),
+    or both to remove only those people who hold that role. Everyone else on the
+    class is preserved. To clear room parents school-wide, call list_classes and
+    repeat this for each class with room_parent_count > 0.
+
+    Args:
+        section_id: Class/section ID (from list_classes)
+        user_ids: One or more people to remove (optional if role is given)
+        role: Remove all holders of this role: TEACHER, ASSISTANT, or ROOM_PARENT
+    """
+    app = _app(context)
+    args = {"section_id": section_id, "user_ids": user_ids, "role": role}
+    if not user_ids and not role:
+        return "❌ Pass user_ids, a role, or both — refusing to remove all staff."
+    resolved_role = None
+    if role:
+        try:
+            resolved_role = normalize_role(role)
+        except ValueError as exc:
+            return f"❌ {exc}"
+    targets = set(user_ids or ())
+    current, err = await _load_class(app, context, section_id)
+    if err:
+        return err
+
+    def _matches(s) -> bool:
+        return (not targets or s.user_id in targets) and (
+            resolved_role is None or s.role == resolved_role
+        )
+
+    removing = [s for s in current.staff if _matches(s)]
+    if not removing:
+        return f"ℹ️ Nothing to remove — no matching staff on \"{current.name}\"."
+    remaining = [s for s in current.staff if not _matches(s)]
+    result = await _put_class_staff(
+        app, context, "remove_class_staff", args, section_id, remaining
+    )
+    if result.startswith("✅"):
+        names = ", ".join(s.name or str(s.user_id) for s in removing)
+        return f"✅ Removed {len(removing)} from \"{current.name}\": {names}."
+    return result
+    removing = [s for s in current.staff if _matches(s)]
+    if not removing:
+        return f"ℹ️ Nothing to remove — no matching staff on \"{current.name}\"."
+    remaining = [s for s in current.staff if not _matches(s)]
+    result = await _put_class_staff(
+        app, context, "remove_class_staff", args, section_id, remaining
+    )
+    if result.startswith("✅"):
+        names = ", ".join(s.name or str(s.user_id) for s in removing)
+        return f"✅ Removed {len(removing)} from \"{current.name}\": {names}."
+    return result
 
 
 # ---------------------------------------------------------------------------
