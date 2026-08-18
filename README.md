@@ -79,7 +79,7 @@ Same write gate and audit log as above; no deletion of classes or staff.
 - **`list_staff`** — Staff and admin roster (user_id, name, email, phone, role/title) as structured JSON, with an optional `name_contains` filter; provides the `user_id` needed by `edit_staff` / `add_class_staff`
 - **`add_staff`** *(write)* — Add a teacher, staff member, or admin, optionally assigning them to classes
 - **`edit_staff`** *(write)* — Update a staff member's name, email, phone, title, or staff ID (class assignments and STAFF/ADMIN access preserved; guardians are rejected — use `edit_parent`)
-- **`add_class_staff`** / **`remove_class_staff`** *(write)* — Assign or unassign teachers, assistants, and room parents for a class
+- **`add_class_staff`** / **`remove_class_staff`** *(write)* — Assign or unassign teachers, assistants, and room parents for a class. These full-replace writes are serialized inside one server process; never issue them in parallel, and verify each result with a fresh `get_class` read.
 - **`list_class_students`** — The students enrolled in a class
 - **`add_class_students`** / **`remove_class_students`** / **`move_student_to_class`** *(write)* — Manage which students are enrolled in which classes
 

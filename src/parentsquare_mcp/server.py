@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import logging
@@ -8,7 +9,7 @@ import re
 import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date as date_cls
 from pathlib import Path
 from typing import Any
@@ -95,6 +96,7 @@ class AppContext:
     client: PSClient
     download_dir: Path
     mfa_state: MFAState | None = None
+    class_staff_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 @asynccontextmanager
@@ -130,7 +132,17 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
     yield AppContext(client=client, download_dir=download_dir, mfa_state=mfa_state)
 
 
-mcp = MCPServer("ParentSquare", lifespan=app_lifespan)
+MCP_INSTRUCTIONS = """
+Class-staff safety: never call add_class_staff or remove_class_staff in parallel,
+even for different sections. ParentSquare's endpoint replaces a section's entire
+staff list, and concurrent writes have caused unrelated class associations to
+disappear. This server serializes those writes within one process, but callers
+must still issue them one at a time and verify with fresh get_class reads; when
+the same people span several sections, also re-check their full associations.
+"""
+
+
+mcp = MCPServer("ParentSquare", lifespan=app_lifespan, instructions=MCP_INSTRUCTIONS)
 
 
 def _app(ctx: Context[Any, Any]) -> AppContext:
@@ -1845,6 +1857,15 @@ async def _put_class_staff(app, context, tool: str, args: dict, section_id: int,
     return _json_write_result(tool, args, resp)
 
 
+def _class_staff_write_lock(app) -> asyncio.Lock:
+    """Return the app-wide lock protecting class-staff read-modify-write calls."""
+    lock = getattr(app, "class_staff_write_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        app.class_staff_write_lock = lock
+    return lock
+
+
 async def _find_new_staff_id(app, context, school_id: int, first_name: str, last_name: str,
                              email: str | None):
     """Look up a just-created staff member's user_id. -> (user_id|None, reason)."""
@@ -2310,6 +2331,12 @@ async def add_class_staff(
 ) -> str:
     """Assign teachers, assistants, or room parents to a class. Requires PS_ENABLE_WRITES.
 
+    SAFETY: Never call this tool or remove_class_staff in parallel, even for
+    different sections. ParentSquare replaces the full staff list, and concurrent
+    writes have caused unrelated associations to disappear. The server serializes
+    calls within this process; still use one call at a time and verify with a fresh
+    get_class read before the next class-staff write.
+
     The class's existing staff are read first and preserved — only the listed
     people are added, all in a single update. Anyone already holding the role is
     skipped; anyone on the class under a different role is moved to this one.
@@ -2336,37 +2363,38 @@ async def add_class_staff(
     except ValueError as exc:
         return f"❌ {exc}"
     wanted = list(dict.fromkeys(user_ids))
-    current, err = await _load_class(app, context, section_id)
-    if err:
-        return err
+    async with _class_staff_write_lock(app):
+        current, err = await _load_class(app, context, section_id)
+        if err:
+            return err
 
-    by_user = {s.user_id: s for s in current.staff}
-    already = [u for u in wanted if u in by_user and by_user[u].role == resolved_role]
-    changing = [u for u in wanted if u not in already]
-    if not changing:
-        names = ", ".join(by_user[u].name or str(u) for u in already)
-        return (
-            f"ℹ️ Already {resolved_role} on \"{current.name}\": {names} — no change made."
-        )
-
-    staff = [s for s in current.staff if s.user_id not in changing]
-    for user_id in changing:
-        existing = by_user.get(user_id)
-        staff.append(
-            ClassStaff(
-                assoc_id=existing.assoc_id if existing else None,
-                user_id=user_id,
-                role=resolved_role,
-                class_title=class_title or default_class_title(resolved_role),
-                first_name=existing.first_name if existing else "",
-                last_name=existing.last_name if existing else "",
+        by_user = {s.user_id: s for s in current.staff}
+        already = [u for u in wanted if u in by_user and by_user[u].role == resolved_role]
+        changing = [u for u in wanted if u not in already]
+        if not changing:
+            names = ", ".join(by_user[u].name or str(u) for u in already)
+            return (
+                f"ℹ️ Already {resolved_role} on \"{current.name}\": {names} — no change made."
             )
-        )
-    result = await _put_class_staff(app, context, "add_class_staff", args, section_id, staff)
-    if result.startswith("✅") and already:
-        skipped = ", ".join(by_user[u].name or str(u) for u in already)
-        return f"{result} ({len(already)} already had the role: {skipped}.)"
-    return result
+
+        staff = [s for s in current.staff if s.user_id not in changing]
+        for user_id in changing:
+            existing = by_user.get(user_id)
+            staff.append(
+                ClassStaff(
+                    assoc_id=existing.assoc_id if existing else None,
+                    user_id=user_id,
+                    role=resolved_role,
+                    class_title=class_title or default_class_title(resolved_role),
+                    first_name=existing.first_name if existing else "",
+                    last_name=existing.last_name if existing else "",
+                )
+            )
+        result = await _put_class_staff(app, context, "add_class_staff", args, section_id, staff)
+        if result.startswith("✅") and already:
+            skipped = ", ".join(by_user[u].name or str(u) for u in already)
+            return f"{result} ({len(already)} already had the role: {skipped}.)"
+        return result
 
 
 @mcp.tool(name="remove_class_staff")
@@ -2378,6 +2406,12 @@ async def remove_class_staff(
     context: Context[Any, Any] = None,
 ) -> str:
     """Remove staff or room parents from a class. Requires PS_ENABLE_WRITES.
+
+    SAFETY: Never call this tool or add_class_staff in parallel, even for
+    different sections. ParentSquare replaces the full staff list, and concurrent
+    writes have caused unrelated associations to disappear. The server serializes
+    calls within this process; still use one call at a time and verify with a fresh
+    get_class read before the next class-staff write.
 
     Pass user_ids to remove specific people, role to remove everyone holding that
     role on the class (e.g. role="ROOM_PARENT" clears that class's room parents),
@@ -2401,37 +2435,27 @@ async def remove_class_staff(
         except ValueError as exc:
             return f"❌ {exc}"
     targets = set(user_ids or ())
-    current, err = await _load_class(app, context, section_id)
-    if err:
-        return err
+    async with _class_staff_write_lock(app):
+        current, err = await _load_class(app, context, section_id)
+        if err:
+            return err
 
-    def _matches(s) -> bool:
-        return (not targets or s.user_id in targets) and (
-            resolved_role is None or s.role == resolved_role
+        def _matches(s) -> bool:
+            return (not targets or s.user_id in targets) and (
+                resolved_role is None or s.role == resolved_role
+            )
+
+        removing = [s for s in current.staff if _matches(s)]
+        if not removing:
+            return f"ℹ️ Nothing to remove — no matching staff on \"{current.name}\"."
+        remaining = [s for s in current.staff if not _matches(s)]
+        result = await _put_class_staff(
+            app, context, "remove_class_staff", args, section_id, remaining
         )
-
-    removing = [s for s in current.staff if _matches(s)]
-    if not removing:
-        return f"ℹ️ Nothing to remove — no matching staff on \"{current.name}\"."
-    remaining = [s for s in current.staff if not _matches(s)]
-    result = await _put_class_staff(
-        app, context, "remove_class_staff", args, section_id, remaining
-    )
-    if result.startswith("✅"):
-        names = ", ".join(s.name or str(s.user_id) for s in removing)
-        return f"✅ Removed {len(removing)} from \"{current.name}\": {names}."
-    return result
-    removing = [s for s in current.staff if _matches(s)]
-    if not removing:
-        return f"ℹ️ Nothing to remove — no matching staff on \"{current.name}\"."
-    remaining = [s for s in current.staff if not _matches(s)]
-    result = await _put_class_staff(
-        app, context, "remove_class_staff", args, section_id, remaining
-    )
-    if result.startswith("✅"):
-        names = ", ".join(s.name or str(s.user_id) for s in removing)
-        return f"✅ Removed {len(removing)} from \"{current.name}\": {names}."
-    return result
+        if result.startswith("✅"):
+            names = ", ".join(s.name or str(s.user_id) for s in removing)
+            return f"✅ Removed {len(removing)} from \"{current.name}\": {names}."
+        return result
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from copy import deepcopy
+from types import SimpleNamespace
 
 from parentsquare_mcp.models import ClassStaff
 from parentsquare_mcp.parsers import classes
@@ -567,6 +569,91 @@ def test_remove_class_staff_rejects_empty_user_ids(monkeypatch, tmp_path):
     msg = asyncio.run(remove_class_staff(50234079, user_ids=[], context="CTX"))
     assert msg.startswith("❌") and "refusing" in msg
     assert sent == {}
+
+
+def test_parallel_class_staff_writes_are_serialized(monkeypatch, tmp_path):
+    """A stale full-replace must not resurrect another call's removal."""
+    from parentsquare_mcp import server
+
+    monkeypatch.setenv("PS_ENABLE_WRITES", "1")
+    monkeypatch.setenv("PS_AUDIT_LOG", str(tmp_path / "audit.log"))
+    state = [
+        ClassStaff(assoc_id=1, user_id=101, role="TEACHER", class_title="Teacher"),
+        ClassStaff(assoc_id=2, user_id=102, role="TEACHER", class_title="Teacher"),
+        ClassStaff(assoc_id=3, user_id=103, role="TEACHER", class_title="Teacher"),
+    ]
+
+    async def fake_load_class(app, context, section_id):
+        snapshot = SimpleNamespace(name="Fake Class", staff=deepcopy(state))
+        await asyncio.sleep(0)
+        return snapshot, None
+
+    async def fake_put_class_staff(app, context, tool, args, section_id, staff):
+        await asyncio.sleep(0)
+        state[:] = deepcopy(staff)
+        return "✅ Success."
+
+    monkeypatch.setattr(server, "_load_class", fake_load_class)
+    monkeypatch.setattr(server, "_put_class_staff", fake_put_class_staff)
+
+    async def run_parallel_removals():
+        app = SimpleNamespace(client=object(), class_staff_write_lock=asyncio.Lock())
+        monkeypatch.setattr(server, "_app", lambda ctx: app)
+        return await asyncio.gather(
+            server.remove_class_staff(9001, user_ids=[101], context="CTX"),
+            server.remove_class_staff(9001, user_ids=[102], context="CTX"),
+        )
+
+    results = asyncio.run(run_parallel_removals())
+    assert all(result.startswith("✅") for result in results)
+    assert [staff.user_id for staff in state] == [103]
+
+
+def test_class_staff_serialization_is_global_across_sections(monkeypatch, tmp_path):
+    from parentsquare_mcp import server
+
+    monkeypatch.setenv("PS_ENABLE_WRITES", "1")
+    monkeypatch.setenv("PS_AUDIT_LOG", str(tmp_path / "audit.log"))
+    active_writes = 0
+    max_active_writes = 0
+
+    async def fake_load_class(app, context, section_id):
+        nonlocal active_writes, max_active_writes
+        active_writes += 1
+        max_active_writes = max(max_active_writes, active_writes)
+        await asyncio.sleep(0)
+        user_id = 101 if section_id == 9001 else 102
+        staff = [ClassStaff(assoc_id=user_id, user_id=user_id, role="TEACHER")]
+        return SimpleNamespace(name=f"Fake Class {section_id}", staff=staff), None
+
+    async def fake_put_class_staff(app, context, tool, args, section_id, staff):
+        nonlocal active_writes
+        await asyncio.sleep(0)
+        active_writes -= 1
+        return "✅ Success."
+
+    monkeypatch.setattr(server, "_load_class", fake_load_class)
+    monkeypatch.setattr(server, "_put_class_staff", fake_put_class_staff)
+
+    async def run_parallel_removals():
+        app = SimpleNamespace(client=object(), class_staff_write_lock=asyncio.Lock())
+        monkeypatch.setattr(server, "_app", lambda ctx: app)
+        return await asyncio.gather(
+            server.remove_class_staff(9001, user_ids=[101], context="CTX"),
+            server.remove_class_staff(9002, user_ids=[102], context="CTX"),
+        )
+
+    results = asyncio.run(run_parallel_removals())
+    assert all(result.startswith("✅") for result in results)
+    assert max_active_writes == 1
+
+
+def test_class_staff_tools_warn_agents_not_to_parallelize():
+    from parentsquare_mcp import server
+
+    assert "Never call this tool" in server.add_class_staff.__doc__
+    assert "Never call this tool" in server.remove_class_staff.__doc__
+    assert "never call add_class_staff or remove_class_staff in parallel" in server.MCP_INSTRUCTIONS
 
 
 # --- add_staff: class assignment follow-up ------------------------------------
