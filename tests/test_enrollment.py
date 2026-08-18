@@ -271,6 +271,96 @@ def test_move_student_to_class_rejects_same_source_and_target():
     assert client.writes == []
 
 
+def test_parallel_moves_preserve_both_enrollments(monkeypatch):
+    """Concurrent full-replace moves must not silently lose one addition."""
+    state = [1]
+
+    async def fake_load_sections_map(app, context, school_id):
+        await asyncio.sleep(0)
+        return {
+            500: [
+                {"section_id": section_id, "name": f"Class {section_id}"}
+                for section_id in state
+            ]
+        }, None
+
+    async def fake_replace_student_sections(
+        app, context, tool, args, student_id, section_ids
+    ):
+        await asyncio.sleep(0)
+        state[:] = section_ids
+        return "✅ Success."
+
+    monkeypatch.setattr(server, "_load_sections_map", fake_load_sections_map)
+    monkeypatch.setattr(server, "_replace_student_sections", fake_replace_student_sections)
+    context = _ctx(FakeClient())
+
+    async def run_parallel_moves():
+        return await asyncio.gather(
+            server.move_student_to_class(13749, 500, 2, context=context),
+            server.move_student_to_class(13749, 500, 3, context=context),
+        )
+
+    results = asyncio.run(run_parallel_moves())
+    assert all(result.startswith("✅") for result in results)
+    assert state == [1, 2, 3]
+
+
+def test_enrollment_and_staff_writes_share_one_global_lock(monkeypatch):
+    active_writes = 0
+    max_active_writes = 0
+
+    async def fake_load_sections_map(app, context, school_id):
+        nonlocal active_writes, max_active_writes
+        active_writes += 1
+        max_active_writes = max(max_active_writes, active_writes)
+        await asyncio.sleep(0)
+        return {500: [{"section_id": 1, "name": "Class 1"}]}, None
+
+    async def fake_replace_student_sections(
+        app, context, tool, args, student_id, section_ids
+    ):
+        nonlocal active_writes
+        await asyncio.sleep(0)
+        active_writes -= 1
+        return "✅ Success."
+
+    async def fake_load_class(app, context, section_id):
+        nonlocal active_writes, max_active_writes
+        active_writes += 1
+        max_active_writes = max(max_active_writes, active_writes)
+        await asyncio.sleep(0)
+        return SimpleNamespace(name="Fake Class", staff=[]), None
+
+    async def fake_put_class_staff(app, context, tool, args, section_id, staff):
+        nonlocal active_writes
+        await asyncio.sleep(0)
+        active_writes -= 1
+        return "✅ Success."
+
+    monkeypatch.setattr(server, "_load_sections_map", fake_load_sections_map)
+    monkeypatch.setattr(server, "_replace_student_sections", fake_replace_student_sections)
+    monkeypatch.setattr(server, "_load_class", fake_load_class)
+    monkeypatch.setattr(server, "_put_class_staff", fake_put_class_staff)
+    context = _ctx(FakeClient())
+
+    async def run_parallel_writes():
+        return await asyncio.gather(
+            server.move_student_to_class(13749, 500, 2, context=context),
+            server.add_class_staff(9001, [101], "TEACHER", context=context),
+        )
+
+    results = asyncio.run(run_parallel_writes())
+    assert all(result.startswith("✅") for result in results)
+    assert max_active_writes == 1
+
+
+def test_enrollment_tools_warn_agents_not_to_parallelize():
+    assert "Never call this tool" in server.add_class_students.__doc__
+    assert "Never call this tool" in server.remove_class_students.__doc__
+    assert "Never call this tool" in server.move_student_to_class.__doc__
+
+
 def test_writes_are_gated(monkeypatch):
     monkeypatch.setenv("PS_ENABLE_WRITES", "0")
     client = FakeClient()

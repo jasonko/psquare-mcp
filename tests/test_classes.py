@@ -597,7 +597,7 @@ def test_parallel_class_staff_writes_are_serialized(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_put_class_staff", fake_put_class_staff)
 
     async def run_parallel_removals():
-        app = SimpleNamespace(client=object(), class_staff_write_lock=asyncio.Lock())
+        app = SimpleNamespace(client=object(), section_membership_write_lock=asyncio.Lock())
         monkeypatch.setattr(server, "_app", lambda ctx: app)
         return await asyncio.gather(
             server.remove_class_staff(9001, user_ids=[101], context="CTX"),
@@ -636,7 +636,7 @@ def test_class_staff_serialization_is_global_across_sections(monkeypatch, tmp_pa
     monkeypatch.setattr(server, "_put_class_staff", fake_put_class_staff)
 
     async def run_parallel_removals():
-        app = SimpleNamespace(client=object(), class_staff_write_lock=asyncio.Lock())
+        app = SimpleNamespace(client=object(), section_membership_write_lock=asyncio.Lock())
         monkeypatch.setattr(server, "_app", lambda ctx: app)
         return await asyncio.gather(
             server.remove_class_staff(9001, user_ids=[101], context="CTX"),
@@ -653,7 +653,7 @@ def test_class_staff_tools_warn_agents_not_to_parallelize():
 
     assert "Never call this tool" in server.add_class_staff.__doc__
     assert "Never call this tool" in server.remove_class_staff.__doc__
-    assert "never call add_class_staff or remove_class_staff in parallel" in server.MCP_INSTRUCTIONS
+    assert "never run class-staff or student-enrollment writes" in server.MCP_INSTRUCTIONS
 
 
 # --- add_staff: class assignment follow-up ------------------------------------

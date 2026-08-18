@@ -96,7 +96,7 @@ class AppContext:
     client: PSClient
     download_dir: Path
     mfa_state: MFAState | None = None
-    class_staff_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    section_membership_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 @asynccontextmanager
@@ -133,12 +133,11 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
 
 
 MCP_INSTRUCTIONS = """
-Class-staff safety: never call add_class_staff or remove_class_staff in parallel,
-even for different sections. ParentSquare's endpoint replaces a section's entire
-staff list, and concurrent writes have caused unrelated class associations to
-disappear. This server serializes those writes within one process, but callers
-must still issue them one at a time and verify with fresh get_class reads; when
-the same people span several sections, also re-check their full associations.
+Section-membership safety: never run class-staff or student-enrollment writes in
+parallel, even for different sections. ParentSquare uses full-replace endpoints,
+and concurrent writes have silently lost staff associations and student classes.
+This server serializes these writes within one process, but callers must still
+issue them one at a time and verify with fresh reads.
 """
 
 
@@ -1857,12 +1856,12 @@ async def _put_class_staff(app, context, tool: str, args: dict, section_id: int,
     return _json_write_result(tool, args, resp)
 
 
-def _class_staff_write_lock(app) -> asyncio.Lock:
-    """Return the app-wide lock protecting class-staff read-modify-write calls."""
-    lock = getattr(app, "class_staff_write_lock", None)
+def _section_membership_write_lock(app) -> asyncio.Lock:
+    """Return the app-wide lock protecting section membership mutations."""
+    lock = getattr(app, "section_membership_write_lock", None)
     if lock is None:
         lock = asyncio.Lock()
-        app.class_staff_write_lock = lock
+        app.section_membership_write_lock = lock
     return lock
 
 
@@ -2363,7 +2362,7 @@ async def add_class_staff(
     except ValueError as exc:
         return f"❌ {exc}"
     wanted = list(dict.fromkeys(user_ids))
-    async with _class_staff_write_lock(app):
+    async with _section_membership_write_lock(app):
         current, err = await _load_class(app, context, section_id)
         if err:
             return err
@@ -2435,7 +2434,7 @@ async def remove_class_staff(
         except ValueError as exc:
             return f"❌ {exc}"
     targets = set(user_ids or ())
-    async with _class_staff_write_lock(app):
+    async with _section_membership_write_lock(app):
         current, err = await _load_class(app, context, section_id)
         if err:
             return err
@@ -2539,6 +2538,10 @@ async def add_class_students(
 ) -> str:
     """Enroll students in a class. Requires PS_ENABLE_WRITES.
 
+    SAFETY: Never call this tool or another class-staff/student-enrollment write
+    in parallel. The server serializes section-membership writes within this
+    process; still use one call at a time and verify with a fresh read.
+
     Adds everyone listed in a single call without disturbing the students
     already in the class or their other classes. Students already enrolled are
     skipped, so re-running is safe.
@@ -2557,30 +2560,33 @@ async def add_class_students(
         return "❌ No student_ids provided — nothing to add."
     wanted = list(dict.fromkeys(student_ids))
 
-    current, err = await _load_class_students(app, context, section_id)
-    if err:
-        return err
-    enrolled = {s.student_id for s in current}
-    already = [s for s in wanted if s in enrolled]
-    adding = [s for s in wanted if s not in enrolled]
-    if not adding:
-        return f"ℹ️ All {len(already)} already in the class — no change made."
+    async with _section_membership_write_lock(app):
+        current, err = await _load_class_students(app, context, section_id)
+        if err:
+            return err
+        enrolled = {s.student_id for s in current}
+        already = [s for s in wanted if s in enrolled]
+        adding = [s for s in wanted if s not in enrolled]
+        if not adding:
+            return f"ℹ️ All {len(already)} already in the class — no change made."
 
-    body = build_add_students_body(section_id, adding)
-    resp, err = await _with_mfa_retry(
-        app,
-        context,
-        lambda: app.client.send_json("PUT", f"/api/v2/sections/{section_id}/add_students", body),
-    )
-    if err:
-        return err
-    result = _json_write_result("add_class_students", args, resp)
-    if not result.startswith("✅"):
-        return result
-    msg = f"✅ Added {len(adding)} student(s) to the class."
-    if already:
-        msg += f" ({len(already)} were already enrolled.)"
-    return msg
+        body = build_add_students_body(section_id, adding)
+        resp, err = await _with_mfa_retry(
+            app,
+            context,
+            lambda: app.client.send_json(
+                "PUT", f"/api/v2/sections/{section_id}/add_students", body
+            ),
+        )
+        if err:
+            return err
+        result = _json_write_result("add_class_students", args, resp)
+        if not result.startswith("✅"):
+            return result
+        msg = f"✅ Added {len(adding)} student(s) to the class."
+        if already:
+            msg += f" ({len(already)} were already enrolled.)"
+        return msg
 
 
 @mcp.tool(name="remove_class_students")
@@ -2592,6 +2598,10 @@ async def remove_class_students(
     context: Context[Any, Any] = None,
 ) -> str:
     """Remove specific students from a class. Requires PS_ENABLE_WRITES.
+
+    SAFETY: Never call this tool or another class-staff/student-enrollment write
+    in parallel. The server serializes the complete school-map read and all
+    resulting student writes within this process.
 
     Each student's other classes are read first and preserved — only this class
     is dropped. student_ids is required: this tool will not empty a class.
@@ -2607,42 +2617,43 @@ async def remove_class_students(
         return "❌ No student_ids provided — refusing to remove all students from the class."
     wanted = list(dict.fromkeys(student_ids))
 
-    current, err = await _load_class_students(app, context, section_id)
-    if err:
-        return err
-    enrolled = {s.student_id: s for s in current}
-    removing = [s for s in wanted if s in enrolled]
-    if not removing:
-        return "ℹ️ None of those students are in this class — no change made."
+    async with _section_membership_write_lock(app):
+        current, err = await _load_class_students(app, context, section_id)
+        if err:
+            return err
+        enrolled = {s.student_id: s for s in current}
+        removing = [s for s in wanted if s in enrolled]
+        if not removing:
+            return "ℹ️ None of those students are in this class — no change made."
 
-    sections_map, err = await _load_sections_map(app, context, school_id)
-    if err:
-        return err
+        sections_map, err = await _load_sections_map(app, context, school_id)
+        if err:
+            return err
 
-    failures: list[str] = []
-    removed: list[str] = []
-    for student_id in removing:
-        keep = [
-            c["section_id"]
-            for c in sections_map.get(student_id, [])
-            if c["section_id"] != section_id
-        ]
-        result = await _replace_student_sections(
-            app, context, "remove_class_students", {**args, "student_id": student_id},
-            student_id, keep,
-        )
-        name = enrolled[student_id].name or str(student_id)
-        if result.startswith("✅"):
-            removed.append(name)
-        else:
-            failures.append(f"{name}: {result}")
+        failures: list[str] = []
+        removed: list[str] = []
+        for student_id in removing:
+            keep = [
+                c["section_id"]
+                for c in sections_map.get(student_id, [])
+                if c["section_id"] != section_id
+            ]
+            result = await _replace_student_sections(
+                app, context, "remove_class_students", {**args, "student_id": student_id},
+                student_id, keep,
+            )
+            name = enrolled[student_id].name or str(student_id)
+            if result.startswith("✅"):
+                removed.append(name)
+            else:
+                failures.append(f"{name}: {result}")
 
-    if failures and not removed:
-        return "❌ Removed nobody. " + "; ".join(failures)
-    msg = f"✅ Removed {len(removed)} student(s) from the class: {', '.join(removed)}."
-    if failures:
-        msg += f" ⚠️ {len(failures)} failed: " + "; ".join(failures)
-    return msg
+        if failures and not removed:
+            return "❌ Removed nobody. " + "; ".join(failures)
+        msg = f"✅ Removed {len(removed)} student(s) from the class: {', '.join(removed)}."
+        if failures:
+            msg += f" ⚠️ {len(failures)} failed: " + "; ".join(failures)
+        return msg
 
 
 @mcp.tool(name="move_student_to_class")
@@ -2655,6 +2666,10 @@ async def move_student_to_class(
     context: Context[Any, Any] = None,
 ) -> str:
     """Switch a student from one class to another. Requires PS_ENABLE_WRITES.
+
+    SAFETY: Never call this tool or another class-staff/student-enrollment write
+    in parallel. The student's full class list is replaced, so the server holds
+    one global lock across the read, computation, and PUT within this process.
 
     Applies both halves of the switch in a single request. The student's other
     classes are preserved. Omit from_section_id to add the new class while
@@ -2672,26 +2687,27 @@ async def move_student_to_class(
     if from_section_id == to_section_id:
         return "❌ from_section_id and to_section_id are the same — nothing to do."
 
-    sections_map, err = await _load_sections_map(app, context, school_id)
-    if err:
-        return err
-    current = [c["section_id"] for c in sections_map.get(student_id, [])]
-    if from_section_id is not None and from_section_id not in current:
-        return f"❌ Student {student_id} is not in class {from_section_id} — no change made."
-    if to_section_id in current and from_section_id is None:
-        return f"ℹ️ Student {student_id} is already in class {to_section_id} — no change made."
+    async with _section_membership_write_lock(app):
+        sections_map, err = await _load_sections_map(app, context, school_id)
+        if err:
+            return err
+        current = [c["section_id"] for c in sections_map.get(student_id, [])]
+        if from_section_id is not None and from_section_id not in current:
+            return f"❌ Student {student_id} is not in class {from_section_id} — no change made."
+        if to_section_id in current and from_section_id is None:
+            return f"ℹ️ Student {student_id} is already in class {to_section_id} — no change made."
 
-    keep = [s for s in current if s != from_section_id]
-    if to_section_id not in keep:
-        keep.append(to_section_id)
-    result = await _replace_student_sections(
-        app, context, "move_student_to_class", args, student_id, keep
-    )
-    if not result.startswith("✅"):
-        return result
-    if from_section_id is None:
-        return f"✅ Added student {student_id} to class {to_section_id}."
-    return f"✅ Moved student {student_id} from class {from_section_id} to {to_section_id}."
+        keep = [s for s in current if s != from_section_id]
+        if to_section_id not in keep:
+            keep.append(to_section_id)
+        result = await _replace_student_sections(
+            app, context, "move_student_to_class", args, student_id, keep
+        )
+        if not result.startswith("✅"):
+            return result
+        if from_section_id is None:
+            return f"✅ Added student {student_id} to class {to_section_id}."
+        return f"✅ Moved student {student_id} from class {from_section_id} to {to_section_id}."
 
 
 # ---------------------------------------------------------------------------
