@@ -66,7 +66,7 @@ def client(monkeypatch):
 
 
 def test_get_json_reaches_the_roster_feed(client):
-    """The end the gotcha actually protects: list_parents et al. keep working."""
+    """The end the rule actually protects: list_parents et al. keep working."""
     assert client.get_json(ROSTER_FEED) == {"data": "ok"}
 
 

@@ -69,6 +69,7 @@ Reverse-engineered from the admin roster UI and verified live (endpoints/bodies 
 - **Writes are `application/x-www-form-urlencoded` Rails posts**, not JSON — use `PSClient.post_form(path, data)` (auto-injects `utf8=✓` + `authenticity_token`, sends `X-CSRF-Token`). It does **not** raise on 4xx/5xx; interpret the result with `write_succeeded()` (**success = HTTP 200 + `text/javascript` body: either a reload script or an `alert-success` flash**; an `alert-danger`/`alert-error` flash or an HTML error page, e.g. 404, is failure). `parse_flash_message()` pulls ParentSquare's own flash text so `_write_result` can surface it (e.g. invite counts).
 - **No created id is returned** — after add_student/add_parent, re-query `list_students` / the roster to get the new id.
 - **Rails method-override:** edit uses a POST with `_method=patch`.
+- **Match the real form's submission param-for-param, and omit any nested/collection key you did not intend to change.** Rails distinguishes a *missing* key from a *present-but-empty* one and treats present-but-empty as "clear it", so a stray empty key silently wipes data while a missing one can blow up the action. Both have caused live incidents here (see `build_add_student_body` / `build_edit_student_body`). This governs every new write tool, so establish the rule from the real form before inventing a body.
 - **Endpoints:** add_student `POST /schools/{id}/students`; edit_student `POST /schools/{id}/students/{sid}` (`_method=patch`); add_parent `POST /schools/{id}/users`; edit_parent + link_guardian `POST /schools/{id}/users/{uid}/update_institute_user` (`_method=patch`).
 - **Parent invitations** (verified live; see vault note "ParentSquare invitations API mapping"): `invite_parent` = `POST /schools/{id}/users/{user_id}/invite` (CSRF-only form body, via `post_form(path, {})`) — emails one guardian, resend uses the same endpoint. `bulk_invite_parents` = `POST /schools/{id}/users/invite` with a **JSON** body `{"ids": "<comma-joined user_ids>", "role": "PARENT", "selected": N}` (via `post_form`-style CSRF but JSON) — sends email/text, auto-skips already-registered ids, and the response is UJS `text/javascript` (not JSON), so it uses **`PSClient.post_json_raw()`** (POST JSON, return raw `Response`). "Invite all" = `bulk_invite_parents` over every `list_parents` guardian with `registered=false` (no dedicated endpoint). Target = guardian `user_id` from `list_parents`.
 - **Roster feeds** (positional-array JSON, whole roster in one call, client-side paging): `GET /schools/{id}/roster/students_data` (14 cols, surfaced by `list_students`) and `.../parents_data` (12 cols, surfaced by `list_parents` — the only tool that exposes a guardian `user_id`) — parsed in `parsers/admin.py`.
@@ -107,30 +108,12 @@ v4 scope, reverse-engineered from `/schools/{id}/roster/assign_classes` and its 
   - `PUT /api/v2/students/{id}/sections` — **full replace** of one student's class list. Body `{"student_id": "<id>", "data": [{"id": "<section_id>", "type": "section"}]}`; `data: []` clears every class. Backs removals and moves.
   - `DELETE /api/v2/sections/{id}/students` — removes **all** students from a class. **Deliberately not exposed** (v1 destructive-op policy).
   - `GET /api/v2/students/{id}/sections` **404s** — the route is PUT-only.
-- **There is no cheap per-student read of current classes.** The GraphQL `StudentProfileSectionView` exposes no `id`/`sectionId`, and the student edit form is useless (see the gotcha below). Instead `/schools/{id}/roster/assign_classes` server-renders **every** student's classes as `<span class="student-sections-{student_id}" data-section-id data-section-name>` — **one HTTP call yields the whole-school map** (`parse_student_sections_map`). Students with no classes render no spans, so a **missing key means "no classes", not "unknown student"**.
+- **There is no cheap per-student read of current classes.** The GraphQL `StudentProfileSectionView` exposes no `id`/`sectionId`, and the student edit form is useless (it never marks a class `selected` — see `extract_student_edit_fields` in `parsers/admin.py`). Instead `/schools/{id}/roster/assign_classes` server-renders **every** student's classes as `<span class="student-sections-{student_id}" data-section-id data-section-name>` — **one HTTP call yields the whole-school map** (`parse_student_sections_map`). Students with no classes render no spans, so a **missing key means "no classes", not "unknown student"**.
 - **Removals and moves are read-modify-write** over that map, because the only removal primitive is the full-replace PUT: read the student's classes, drop/swap one, PUT the rest back. This is why `remove_class_students` and `move_student_to_class` take a `school_id`.
 - **`remove_class_students` refuses an empty `student_ids` list** — an empty list must never degrade into "empty the class". `add_class_students` skips ids already enrolled, so re-running is safe.
 - **No multi-class bulk endpoint exists** (`bulk_update_sections` is term dates; `bulk_update_class_visibility` is visibility). Start-of-year assignment is therefore an agent loop of `add_class_students` — one call per classroom, not per student. A loop-free mega-tool was considered and rejected: it would save zero HTTP calls while removing per-classroom checkpoints.
 - **CSV import is not a viable alternative**: `sections/sample_roster_csv` matches rows on **Student External ID** with no name/email fallback, and 290 of 644 students have no SIS id.
 
-
-## Known Gotchas
-
-Each of these is a trap where **the code looks wrong and the obvious cleanup is a live
-incident**. The forensic detail lives in a docstring next to the code it guards, so it can't
-drift out of sync — read that docstring before changing any of them.
-
-| Trap | Documented at |
-| --- | --- |
-| `student[section_ids][]` is **required on create and forbidden on edit**. Omitting it on create returns HTTP 500 *after* committing the student; a present-but-empty value on edit unenrolls them from every class. Don't "harmonise" the two. | `build_add_student_body` / `build_edit_student_body` in `parsers/admin.py`; pinned by `test_section_ids_rule_is_opposite_for_create_and_edit` |
-| The student edit form never marks any class `<option selected>`, so scraping it returns `[]` for every student. | `extract_student_edit_fields` in `parsers/admin.py` |
-| A 5xx is not a verdict — the read-back decides. Retries are one-way: there is no delete route for a duplicate student. | `_write_result_verified` in `server.py`; surfaced in the `add_student` tool description |
-| Some schools post monthly calendars as feed images rather than using ICS. | `get_calendar_events` tool description |
-| Feeds render both truncated and expanded post text; the parser must prefer expanded. | `parse_feed_page` in `parsers/feeds.py` |
-
-**The rule behind most of these:** match the real form's submission param-for-param, and **omit
-any nested/collection key you did not intend to change** — Rails distinguishes *missing* from
-*present-but-empty*, and treats present-but-empty as "clear it".
 
 ## Development
 
