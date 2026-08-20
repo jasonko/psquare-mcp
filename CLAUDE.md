@@ -116,6 +116,29 @@ v4 scope, reverse-engineered from `/schools/{id}/roster/assign_classes` and its 
 
 ## Known Gotchas
 
+### `student[section_ids][]` is required on create and forbidden on edit
+The same param has **opposite** rules on the two student endpoints, and getting either wrong is a live incident. `parsers/admin.py` encodes both; don't "harmonise" them.
+
+- **create** (`build_add_student_body`) — the key must be **present and empty**, exactly as the roster's Add Student form submits it. Omitting it makes `POST /schools/{id}/students` return **HTTP 500 after committing the student**: Rails sees `nil` instead of `[""]` and the post-save enrolment handling raises, so the record and its `Successfully added student!` flash survive but the render dies. The tool reported `❌`, which invited retries, and every retry duplicated a real student.
+- **edit** (`build_edit_student_body`) — the key must be **absent** unless enrolment is deliberately changing, because present-but-empty is a full replace that unenrolls the student from every class (see the next gotcha).
+
+Isolated live on school 13749 with three otherwise byte-identical POSTs:
+
+| `student[section_ids][]` | `Referer` | Result |
+| --- | --- | --- |
+| omitted | present | **HTTP 500**, student created |
+| present, empty | present | HTTP 200 `text/javascript` reload |
+| present, empty | absent | HTTP 200 `text/javascript` reload |
+
+The param, not the headers, is the whole story. This was misdiagnosed for months as an unfixable ParentSquare bug — the earlier probes (validation-failure payload returns a healthy UJS response; a plain non-AJAX HTML post fails identically; `add_parent`/`edit_parent`/`link_guardian_to_student` succeed on the same session) all correctly ruled out the route, CSRF token, session and headers, but every one of them also omitted `section_ids`, so they only ever proved the failure was *specific to the student create*. **Any doc claiming ParentSquare is at fault, or that the 500 comes from the post-write verification read, is wrong.** Pinned by `test_build_add_student_body_sends_an_empty_section_ids_key`, `test_add_student_body_matches_the_roster_form_submission` and `test_section_ids_rule_is_opposite_for_create_and_edit`.
+
+**General rule:** match the real form's submission param-for-param. Rails distinguishes *missing* from *present-but-empty*, and both a missing key and an unwanted empty one have caused production bugs here.
+
+### A 5xx is not a verdict — the read-back decides
+ParentSquare renders its error page *after* the transaction commits, so a 5xx can hide a write that landed (as `add_student` did on every create). `_write_result_verified` therefore treats `5xx` as "no verdict" and lets the read-back decide: found → `✅ Success (verified)` + "do NOT retry"; not found → `❌`; read-back unavailable → `⚠️` "unknown, do not retry blindly". A `4xx` or a `200` + `alert-danger` **is** a verdict (an explicit rejection) and stays a failure regardless of read-back, since a record found then would be a pre-existing one. `write_succeeded` stays strict — a 500 remains a failure for endpoints with no read-back to overrule it — so this belongs in the tools' result handling, never in the generic heuristic. `add_staff` gets the same 5xx-gated read-back via `_find_new_staff_id`; `add_parent` and `link_guardian_to_student` inherit it. `_readback()` wraps every verification read so a broken read can't escape and hide the write's outcome.
+
+**Retries are one-way.** `GET /schools/{id}/students` 404s (POST-only route) and there is no delete route (`POST /schools/{id}/students/{id}` with `_method=delete` → 404), so a duplicate student — or anything created by probe work — can only be removed through the website.
+
 ### The student edit form lies about class enrollment
 `<select name="student[section_ids][]">` on `/schools/{id}/students/{sid}/edit` is server-rendered with the grade's available classes but **never marks any option `selected`**, and `data-initval` is always `"[]"` — the current enrollment is fetched separately by JS. Scraping it therefore returns `[]` for every student, and echoing that back as `student[section_ids][]=""` makes Rails **unenroll the student from every class**. This shipped as a live data-loss bug in `edit_student` (fixed: `extract_student_edit_fields` no longer reads the field, and `build_edit_student_body` **omits** the key unless a caller passes an explicit list). General rule, same as `kids_attributes` on parent PATCHes: **omit any nested/collection key you did not intend to change** — Rails treats present-but-empty as "clear it".
 

@@ -1252,6 +1252,16 @@ def _write_result(tool: str, args: dict, resp) -> str:
     return f"❌ Operation failed (HTTP {resp.status_code}). ParentSquare response: {snippet}"
 
 
+# A 5xx tells us nothing about whether a write committed — ParentSquare's error
+# page is rendered after the transaction. A write that crashes on render can and
+# does leave the record behind (see build_add_student_body), so reporting a hard
+# failure invites a retry that duplicates a real record. The read-back decides.
+_SERVER_ERROR_NOTE = (
+    "ParentSquare crashed rendering its response, which happens after the record "
+    "is saved, so the status code says nothing about whether the write landed."
+)
+
+
 def _write_result_verified(tool: str, args: dict, resp, verified: bool | None) -> str:
     """Interpret a form-write Response using a read-back result, audit, and format.
 
@@ -1264,11 +1274,45 @@ def _write_result_verified(tool: str, args: dict, resp, verified: bool | None) -
       failure; this is the false-positive the old heuristic missed).
     - ``None``  — the read-back itself could not run (e.g. MFA/network); the write
       may well have succeeded but we can't confirm it.
+
+    The read-back also outranks a *server-side* failure. ParentSquare renders its
+    error page after the transaction commits, so a 5xx can hide a write that
+    landed — ``add_student`` did exactly that for every create until the missing
+    ``student[section_ids][]`` param was found. Reporting such a response as
+    ``❌`` invites a retry, and a retry duplicates a real record with no API
+    route to undo it. So on a 5xx, where ParentSquare has returned a stack trace
+    rather than a verdict, the read-back decides. A 4xx or a ``200`` +
+    ``alert-danger`` *is* a verdict — ParentSquare explicitly rejecting the
+    write — and is still reported as a failure regardless of read-back (the
+    record found there would be a pre-existing one). ``write_succeeded`` is
+    deliberately left strict: a 500 remains a failure for every endpoint that
+    has no read-back to overrule it.
     """
     http_ok = write_succeeded(resp.status_code, resp.headers.get("content-type", ""), resp.text)
     if not http_ok:
-        audit_write(tool, args, False, detail=f"HTTP {resp.status_code}")
         snippet = " ".join(resp.text.split())[:200]
+        crashed = resp.status_code >= 500  # no verdict from ParentSquare, only a stack trace
+        if crashed and verified is True:
+            audit_write(
+                tool, args, True, detail=f"HTTP {resp.status_code}; verified by read-back"
+            )
+            return (
+                f"✅ Success (verified). Note: ParentSquare returned HTTP "
+                f"{resp.status_code}. {_SERVER_ERROR_NOTE} Reading it back confirms the "
+                "record was created — do NOT retry: a retry would create a duplicate. "
+                "Worth reporting, since a 5xx here usually means a malformed request."
+            )
+        if crashed and verified is None:
+            audit_write(
+                tool, args, False, detail=f"HTTP {resp.status_code}; read-back unavailable"
+            )
+            return (
+                f"⚠️ ParentSquare returned HTTP {resp.status_code} and the read-back could "
+                f"not run, so it is unknown whether the write landed. {_SERVER_ERROR_NOTE} "
+                "Do NOT retry blindly — check with list_students / get_student first. "
+                f"ParentSquare response: {snippet}"
+            )
+        audit_write(tool, args, False, detail=f"HTTP {resp.status_code}")
         return f"❌ Operation failed (HTTP {resp.status_code}). ParentSquare response: {snippet}"
     if verified is False:
         audit_write(tool, args, False, detail=f"HTTP {resp.status_code}; read-back not found")
@@ -1287,6 +1331,19 @@ def _write_result_verified(tool: str, args: dict, resp, verified: bool | None) -
     return "✅ Success (verified)."
 
 
+async def _readback(app, context, fn):
+    """Run a post-write verification read. -> (result, error_message|None).
+
+    Never raises: the read-back now decides whether a write is reported as a
+    success (see ``_write_result_verified``), so a failure to read must degrade
+    to "unverified" rather than escape and hide the write's outcome entirely.
+    """
+    try:
+        return await _with_mfa_retry(app, context, fn)
+    except Exception as exc:  # noqa: BLE001 — verification must never mask the write
+        return None, f"read-back failed: {exc}"
+
+
 async def _student_guardians(app, context, student_id: int):
     """Read a student's current guardian list via the profile GraphQL. -> (guardians, err)."""
     def _fetch():
@@ -1295,7 +1352,7 @@ async def _student_guardians(app, context, student_id: int):
         )
         return parse_student_profile(data)
 
-    profile, err = await _with_mfa_retry(app, context, _fetch)
+    profile, err = await _readback(app, context, _fetch)
     if err:
         return None, err
     return (profile.parents if profile else []), None
@@ -1486,6 +1543,12 @@ async def add_student(
     Use list_grades(school_id) to find the grade_id. The new student's id is not
     returned by ParentSquare — call list_students afterward to retrieve it.
 
+    The roster is read back after the write, so the result says whether the
+    student actually exists. If ParentSquare ever returns a 5xx here, do not
+    retry on the status code alone: its error page is rendered after the record
+    is saved, so the student may well have been created, and there is no API
+    route to delete a duplicate.
+
     Args:
         school_id: School ID
         first_name: Student first name
@@ -1502,7 +1565,7 @@ async def add_student(
     )
     if err:
         return err
-    students, verr = await _with_mfa_retry(
+    students, verr = await _readback(
         app, context, lambda: _roster_students(app.client, school_id)
     )
     verified = None if verr else roster_has_student(students, first_name, last_name)
@@ -1873,7 +1936,7 @@ async def _find_new_staff_id(app, context, school_id: int, first_name: str, last
         data = app.client.get_json(f"/schools/{school_id}/roster/staff_data")
         return parse_roster_staff(data.get("data", []))
 
-    staff, err = await _with_mfa_retry(app, context, _fetch)
+    staff, err = await _readback(app, context, _fetch)
     if err:
         return None, "the staff roster could not be read."
     if email:
@@ -2191,16 +2254,41 @@ async def add_staff(
     if err:
         return err
     result = _write_result("add_staff", args, resp)
+    user_id, lookup_err = None, ""
     if not result.startswith("✅"):
-        return result
+        if resp.status_code < 500:
+            return result  # ParentSquare explicitly rejected the write
+        # A 5xx is a crash, not a verdict — the record may well have committed
+        # (see _write_result_verified). Read the roster back before reporting a
+        # failure: a blind retry would create a duplicate staff member.
+        user_id, lookup_err = await _find_new_staff_id(
+            app, context, school_id, first_name, last_name, email
+        )
+        if not user_id:
+            return result
+        audit_write(
+            "add_staff", args, True,
+            detail=f"HTTP {resp.status_code} reported failure; read-back found the record",
+        )
+        result = (
+            f"✅ Success (verified). Note: ParentSquare returned HTTP {resp.status_code}, "
+            "but its error page is rendered after the record is saved and the staff "
+            "member is on the roster — the account was created. Do NOT retry: a retry "
+            "would create a duplicate."
+        )
     created = f"{result} Added {first_name} {last_name}."
     if not section_ids:
+        if user_id:
+            return f"{created} user_id {user_id}."
         return f"{created} Find their user_id with list_staff."
 
-    user_id, err = await _find_new_staff_id(app, context, school_id, first_name, last_name, email)
+    if not user_id:
+        user_id, lookup_err = await _find_new_staff_id(
+            app, context, school_id, first_name, last_name, email
+        )
     if not user_id:
         return (
-            f"{created} ⚠️ But their class assignment could not be completed: {err} "
+            f"{created} ⚠️ But their class assignment could not be completed: {lookup_err} "
             "Find them with list_staff and assign the classes with add_class_staff."
         )
     assigned, failed = [], []

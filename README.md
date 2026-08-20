@@ -109,6 +109,16 @@ POST is accepted but the read-back can't find the change, they return a `⚠️`
 warning that it likely did not persist; if the read-back itself can't run, they
 report the write as submitted-but-unverified.
 
+The read-back also overrules a `5xx`. ParentSquare renders its error page *after*
+the transaction commits, so a server error can hide a write that actually landed
+— `add_student` did exactly that on every create until a missing
+`student[section_ids][]` form param was tracked down. Reporting those as failures
+invited retries, and each retry duplicated a real student with no API route to
+delete one. So when a write returns a `5xx` but the record is found on read-back,
+the tool reports `✅ Success (verified)` with a note not to retry. An explicit
+rejection (a `4xx`, or a `200` carrying an `alert-danger` flash) is still
+reported as a failure regardless of read-back.
+
 ### Prerequisites
 
 Credentials can be provided in either of two ways (checked in this order):

@@ -672,7 +672,21 @@ class _FakeUjsResp:
     text = "window.location.reload();"
 
 
-def _patch_add_staff(monkeypatch, tmp_path, roster=STAFF_ROSTER):
+class _FakeErrorPageResp:
+    """ParentSquare's branded HTML error page, returned at HTTP 500."""
+    status_code = 500
+    headers = {"content-type": "text/html; charset=utf-8"}
+    text = "<!DOCTYPE html><html><body>Something went wrong. Support Code: abc</body></html>"
+
+
+class _FakeRejectionResp:
+    """An explicit rejection: HTTP 200 UJS carrying a danger flash."""
+    status_code = 200
+    headers = {"content-type": "text/javascript; charset=utf-8"}
+    text = "$('#modal-add-user-error').html('<div class=\"alert-danger\">Email taken</div>');"
+
+
+def _patch_add_staff(monkeypatch, tmp_path, roster=STAFF_ROSTER, post_resp=None):
     from parentsquare_mcp import server
 
     monkeypatch.setenv("PS_ENABLE_WRITES", "1")
@@ -682,7 +696,7 @@ def _patch_add_staff(monkeypatch, tmp_path, roster=STAFF_ROSTER):
     class _FakeClient:
         def post_form(self, path, data):
             calls["form_path"], calls["form"] = path, data
-            return _FakeUjsResp()
+            return post_resp or _FakeUjsResp()
 
         def get_json(self, path, params=None):
             return roster if "staff_data" in path else SECTION_DETAIL
@@ -737,3 +751,36 @@ def test_add_staff_rejects_a_bad_class_role(monkeypatch, tmp_path):
                                 class_role="principal", context="CTX"))
     assert msg.startswith("❌")
     assert "form" not in calls                    # nothing was created
+
+
+# A 5xx from ParentSquare is a crash, not a verdict — the account may well have
+# been created (as it always is by POST /schools/{id}/students), so add_staff
+# reads the roster back before telling anyone a retry is safe.
+
+def test_add_staff_reports_success_when_5xx_but_the_account_exists(monkeypatch, tmp_path):
+    from parentsquare_mcp.server import add_staff
+
+    _patch_add_staff(monkeypatch, tmp_path, post_resp=_FakeErrorPageResp())
+    msg = asyncio.run(add_staff(13749, "Apitest", "Teacher", email="new@example.com",
+                                context="CTX"))
+    assert msg.startswith("✅") and "500" in msg and "do not retry" in msg.lower()
+
+
+def test_add_staff_reports_failure_when_5xx_and_the_account_is_absent(monkeypatch, tmp_path):
+    from parentsquare_mcp.server import add_staff
+
+    _patch_add_staff(monkeypatch, tmp_path, roster={"data": []},
+                     post_resp=_FakeErrorPageResp())
+    msg = asyncio.run(add_staff(13749, "Ghost", "Person", email="ghost@example.com",
+                                context="CTX"))
+    assert msg.startswith("❌") and "500" in msg
+
+
+def test_add_staff_trusts_an_explicit_rejection_over_the_roster(monkeypatch, tmp_path):
+    """A 200 + alert-danger means rejected; the roster match is a pre-existing user."""
+    from parentsquare_mcp.server import add_staff
+
+    _patch_add_staff(monkeypatch, tmp_path, post_resp=_FakeRejectionResp())
+    msg = asyncio.run(add_staff(13749, "Apitest", "Teacher", email="new@example.com",
+                                context="CTX"))
+    assert msg.startswith("❌")

@@ -146,7 +146,41 @@ def test_build_add_student_body():
     assert b["student[grade_id]"] == "545988"
     assert b["student[external_id]"] == "SIS-1"
     assert b["commit"] == "Add Student"
-    assert "student[section_ids][]" not in b
+
+
+def test_build_add_student_body_sends_an_empty_section_ids_key():
+    """Regression: omitting student[section_ids][] makes the create 500.
+
+    Verified live against school 13749 — three otherwise byte-identical POSTs to
+    /schools/13749/students:
+
+      - key omitted, Referer present -> HTTP 500 (student still created)
+      - key present and empty, Referer present -> HTTP 200 text/javascript reload
+      - key present and empty, Referer absent -> HTTP 200 text/javascript reload
+
+    So the key, not the headers, is what the create action needs: Rails sees
+    ``nil`` instead of ``[""]`` and crashes *after* committing the record. The
+    500 looked like a ParentSquare bug for months; it was a missing param.
+    """
+    b = admin.build_add_student_body("Jane", "Doe", 545988)
+    assert b["student[section_ids][]"] == ""
+
+
+def test_add_student_body_matches_the_roster_form_submission():
+    """The built body must match the Add Student form's own POST, param for param."""
+    from urllib.parse import parse_qsl
+
+    # captured from DevTools on /schools/13749/roster/add_remove_students
+    browser = (
+        "utf8=%E2%9C%93&authenticity_token=TOKEN&student%5Bfirst_name%5D=testfirst"
+        "&student%5Blast_name%5D=testlast&student%5Bexternal_id%5D="
+        "&student%5Bgrade_id%5D=545988&student%5Bsection_ids%5D%5B%5D="
+        "&commit=Add+Student"
+    )
+    # utf8 + authenticity_token are injected by PSClient.post_form, not the builder
+    expected = {k: v for k, v in parse_qsl(browser, keep_blank_values=True)
+                if k not in ("utf8", "authenticity_token")}
+    assert admin.build_add_student_body("testfirst", "testlast", 545988) == expected
 
 
 def test_build_edit_student_body_uses_patch():
@@ -161,6 +195,18 @@ def test_build_edit_student_body_omits_sections_by_default():
     that isn't changing enrollment must omit the key or it wipes every class."""
     b = admin.build_edit_student_body("Jane", "Doe", "545988", "SIS-9")
     assert "student[section_ids][]" not in b
+
+
+def test_section_ids_rule_is_opposite_for_create_and_edit():
+    """The asymmetry is deliberate and both halves are load-bearing.
+
+    create: the key must be present-and-empty or the POST 500s (after saving).
+    edit:   the key must be absent or Rails clears every class enrolment.
+    """
+    create = admin.build_add_student_body("Jane", "Doe", 545988)
+    edit = admin.build_edit_student_body("Jane", "Doe", "545988")
+    assert create["student[section_ids][]"] == ""
+    assert "student[section_ids][]" not in edit
 
 
 def test_build_edit_student_body_replaces_sections_when_given():
@@ -431,5 +477,123 @@ def test_write_result_verified_http_failure_short_circuits(tmp_path, monkeypatch
 
     monkeypatch.setenv("PS_AUDIT_LOG", str(tmp_path / "audit.log"))
     resp = _FakeResp(status_code=404, content_type="text/html", text="<html>nope</html>")
-    msg = _write_result_verified("add_parent", {}, resp, True)  # verified ignored on HTTP failure
+    msg = _write_result_verified("add_parent", {}, resp, False)
     assert msg.startswith("❌") and "404" in msg
+
+
+# --- ParentSquare's post-create 500 (server-side render crash) ----------------
+# POST /schools/{id}/students commits the student and then 500s rendering the
+# following page, so a *successful* create looks like a hard failure. The
+# read-back, not the status code, decides — a blind retry duplicates a student
+# and there is no API route to delete one.
+
+_ERROR_PAGE = "<!DOCTYPE html><html><body>Successfully added student! Support Code: abc</body></html>"
+
+
+def _server_error_resp():
+    return _FakeResp(status_code=500, content_type="text/html", text=_ERROR_PAGE)
+
+
+def test_write_result_verified_500_with_readback_reports_success(tmp_path, monkeypatch):
+    from parentsquare_mcp.server import _write_result_verified
+
+    log = tmp_path / "audit.log"
+    monkeypatch.setenv("PS_AUDIT_LOG", str(log))
+    msg = _write_result_verified("add_student", {}, _server_error_resp(), True)
+    assert msg.startswith("✅")
+    assert "500" in msg and "do not retry" in msg.lower()
+    assert json.loads(log.read_text().strip())["ok"] is True
+
+
+def test_write_result_verified_500_without_readback_reports_failure(tmp_path, monkeypatch):
+    from parentsquare_mcp.server import _write_result_verified
+
+    log = tmp_path / "audit.log"
+    monkeypatch.setenv("PS_AUDIT_LOG", str(log))
+    msg = _write_result_verified("add_student", {}, _server_error_resp(), False)
+    assert msg.startswith("❌") and "500" in msg
+    assert json.loads(log.read_text().strip())["ok"] is False
+
+
+def test_write_result_verified_500_with_unavailable_readback_warns(tmp_path, monkeypatch):
+    from parentsquare_mcp.server import _write_result_verified
+
+    monkeypatch.setenv("PS_AUDIT_LOG", str(tmp_path / "audit.log"))
+    msg = _write_result_verified("add_student", {}, _server_error_resp(), None)
+    assert msg.startswith("⚠️") and "do not retry blindly" in msg.lower()
+
+
+def test_write_result_verified_explicit_rejection_ignores_readback(tmp_path, monkeypatch):
+    """A 4xx / alert-danger is ParentSquare *rejecting* the write, not crashing."""
+    from parentsquare_mcp.server import _write_result_verified
+
+    monkeypatch.setenv("PS_AUDIT_LOG", str(tmp_path / "audit.log"))
+    rejected = _FakeResp(
+        status_code=200,
+        content_type="text/javascript",
+        text="$('#student_errors').html('<div class=\"alert-danger\">Name taken</div>');",
+    )
+    msg = _write_result_verified("add_student", {}, rejected, True)
+    assert msg.startswith("❌")
+
+
+# --- add_student tool end-to-end ---------------------------------------------
+
+_ROSTER_ROW = [None, 61232363, None, "Test Grade", "", "", "Probealpha, Probealpha", "",
+               "", "", "Active", 1, "No", None]
+
+
+class _FakeClient:
+    def __init__(self, post_resp, roster_rows):
+        self._post_resp = post_resp
+        self._roster_rows = roster_rows
+        self.posts = []
+
+    def post_form(self, path, data):
+        self.posts.append((path, data))
+        return self._post_resp
+
+    def get_json(self, path, params=None):
+        return {"data": self._roster_rows}
+
+
+def _run_add_student(client):
+    from types import SimpleNamespace
+
+    from parentsquare_mcp import server
+
+    app = SimpleNamespace(client=client, mfa_state=None)
+    ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
+    return asyncio.run(
+        server.add_student(13749, "Probealpha", "Probealpha", 545988, context=ctx)
+    )
+
+
+def test_add_student_reports_success_when_500_but_student_created(tmp_path, monkeypatch):
+    monkeypatch.setenv("PS_ENABLE_WRITES", "1")
+    monkeypatch.setenv("PS_AUDIT_LOG", str(tmp_path / "audit.log"))
+    client = _FakeClient(_server_error_resp(), [_ROSTER_ROW])
+    msg = _run_add_student(client)
+    assert msg.startswith("✅")
+    assert "500" in msg and "do not retry" in msg.lower()
+    assert client.posts[0][0] == "/schools/13749/students"
+
+
+def test_add_student_reports_failure_when_500_and_student_absent(tmp_path, monkeypatch):
+    monkeypatch.setenv("PS_ENABLE_WRITES", "1")
+    monkeypatch.setenv("PS_AUDIT_LOG", str(tmp_path / "audit.log"))
+    msg = _run_add_student(_FakeClient(_server_error_resp(), []))
+    assert msg.startswith("❌") and "500" in msg
+
+
+def test_add_student_warns_when_readback_raises(tmp_path, monkeypatch):
+    """A broken read-back must not mask the write or invite a retry."""
+    monkeypatch.setenv("PS_ENABLE_WRITES", "1")
+    monkeypatch.setenv("PS_AUDIT_LOG", str(tmp_path / "audit.log"))
+
+    class _Boom(_FakeClient):
+        def get_json(self, path, params=None):
+            raise RuntimeError("network down")
+
+    msg = _run_add_student(_Boom(_server_error_resp(), []))
+    assert msg.startswith("⚠️") and "do not retry blindly" in msg.lower()

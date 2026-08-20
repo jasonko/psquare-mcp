@@ -216,15 +216,24 @@ def parse_student_profile(data: dict) -> AdminStudentProfile | None:
 def build_add_student_body(first_name: str, last_name: str, grade_id: int, sis_id: str = "") -> dict:
     """Body for ``POST /schools/{school_id}/students``.
 
-    ``student[section_ids][]`` is deliberately omitted — see
-    ``build_edit_student_body``. A new student has no classes to preserve, but
-    sending the key serves no purpose either.
+    ``student[section_ids][]`` must be present and empty, exactly as the roster's
+    Add Student form submits it. Omitting it makes the create action return HTTP
+    500 *after* committing the student — verified live: the identical request
+    with the key present returns a clean 200 UJS reload, and without it returns
+    ParentSquare's error page. Rails sees ``nil`` instead of ``[""]`` and the
+    post-save enrollment handling blows up on it.
+
+    Note this is the opposite of ``build_edit_student_body``, which must omit the
+    key: on an *edit* a present-but-empty collection means "clear it" and would
+    unenroll the student from every class, whereas a brand-new student has no
+    enrollment to lose.
     """
     return {
         "student[first_name]": first_name,
         "student[last_name]": last_name,
         "student[external_id]": sis_id or "",
         "student[grade_id]": str(grade_id),
+        "student[section_ids][]": "",
         "commit": "Add Student",
     }
 
