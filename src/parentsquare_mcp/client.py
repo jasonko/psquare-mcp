@@ -292,6 +292,7 @@ class PSClient:
         # Accept must stay JSON-only: the Rails roster feeds (e.g.
         # /schools/{id}/roster/parents_data) 404 if text/javascript is offered,
         # because respond_to then picks the JS format, which has no template.
+        # Pinned by tests/test_accept_headers.py.
         headers = {"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"}
         resp = self.session.get(url, params=params, headers=headers)
 

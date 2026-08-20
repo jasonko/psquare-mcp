@@ -125,7 +125,6 @@ drift out of sync — read that docstring before changing any of them.
 | `student[section_ids][]` is **required on create and forbidden on edit**. Omitting it on create returns HTTP 500 *after* committing the student; a present-but-empty value on edit unenrolls them from every class. Don't "harmonise" the two. | `build_add_student_body` / `build_edit_student_body` in `parsers/admin.py`; pinned by `test_section_ids_rule_is_opposite_for_create_and_edit` |
 | The student edit form never marks any class `<option selected>`, so scraping it returns `[]` for every student. | `extract_student_edit_fields` in `parsers/admin.py` |
 | A 5xx is not a verdict — the read-back decides. Retries are one-way: there is no delete route for a duplicate student. | `_write_result_verified` in `server.py`; surfaced in the `add_student` tool description |
-| `get_json`'s `Accept` must stay JSON-only, or the Rails roster feeds 404 and `list_parents`/`list_students`/`list_staff` silently die. | `PSClient.get_json` in `client.py` — **the only one with no test pinning it** |
 | Some schools post monthly calendars as feed images rather than using ICS. | `get_calendar_events` tool description |
 | Feeds render both truncated and expanded post text; the parser must prefer expanded. | `parse_feed_page` in `parsers/feeds.py` |
 
