@@ -116,42 +116,22 @@ v4 scope, reverse-engineered from `/schools/{id}/roster/assign_classes` and its 
 
 ## Known Gotchas
 
-### `student[section_ids][]` is required on create and forbidden on edit
-The same param has **opposite** rules on the two student endpoints, and getting either wrong is a live incident. `parsers/admin.py` encodes both; don't "harmonise" them.
+Each of these is a trap where **the code looks wrong and the obvious cleanup is a live
+incident**. The forensic detail lives in a docstring next to the code it guards, so it can't
+drift out of sync — read that docstring before changing any of them.
 
-- **create** (`build_add_student_body`) — the key must be **present and empty**, exactly as the roster's Add Student form submits it. Omitting it makes `POST /schools/{id}/students` return **HTTP 500 after committing the student**: Rails sees `nil` instead of `[""]` and the post-save enrolment handling raises, so the record and its `Successfully added student!` flash survive but the render dies. The tool reported `❌`, which invited retries, and every retry duplicated a real student.
-- **edit** (`build_edit_student_body`) — the key must be **absent** unless enrolment is deliberately changing, because present-but-empty is a full replace that unenrolls the student from every class (see the next gotcha).
+| Trap | Documented at |
+| --- | --- |
+| `student[section_ids][]` is **required on create and forbidden on edit**. Omitting it on create returns HTTP 500 *after* committing the student; a present-but-empty value on edit unenrolls them from every class. Don't "harmonise" the two. | `build_add_student_body` / `build_edit_student_body` in `parsers/admin.py`; pinned by `test_section_ids_rule_is_opposite_for_create_and_edit` |
+| The student edit form never marks any class `<option selected>`, so scraping it returns `[]` for every student. | `extract_student_edit_fields` in `parsers/admin.py` |
+| A 5xx is not a verdict — the read-back decides. Retries are one-way: there is no delete route for a duplicate student. | `_write_result_verified` in `server.py`; surfaced in the `add_student` tool description |
+| `get_json`'s `Accept` must stay JSON-only, or the Rails roster feeds 404 and `list_parents`/`list_students`/`list_staff` silently die. | `PSClient.get_json` in `client.py` — **the only one with no test pinning it** |
+| Some schools post monthly calendars as feed images rather than using ICS. | `get_calendar_events` tool description |
+| Feeds render both truncated and expanded post text; the parser must prefer expanded. | `parse_feed_page` in `parsers/feeds.py` |
 
-Isolated live on school 13749 with three otherwise byte-identical POSTs:
-
-| `student[section_ids][]` | `Referer` | Result |
-| --- | --- | --- |
-| omitted | present | **HTTP 500**, student created |
-| present, empty | present | HTTP 200 `text/javascript` reload |
-| present, empty | absent | HTTP 200 `text/javascript` reload |
-
-The param, not the headers, is the whole story. This was misdiagnosed for months as an unfixable ParentSquare bug — the earlier probes (validation-failure payload returns a healthy UJS response; a plain non-AJAX HTML post fails identically; `add_parent`/`edit_parent`/`link_guardian_to_student` succeed on the same session) all correctly ruled out the route, CSRF token, session and headers, but every one of them also omitted `section_ids`, so they only ever proved the failure was *specific to the student create*. **Any doc claiming ParentSquare is at fault, or that the 500 comes from the post-write verification read, is wrong.** Pinned by `test_build_add_student_body_sends_an_empty_section_ids_key`, `test_add_student_body_matches_the_roster_form_submission` and `test_section_ids_rule_is_opposite_for_create_and_edit`.
-
-**General rule:** match the real form's submission param-for-param. Rails distinguishes *missing* from *present-but-empty*, and both a missing key and an unwanted empty one have caused production bugs here.
-
-### A 5xx is not a verdict — the read-back decides
-ParentSquare renders its error page *after* the transaction commits, so a 5xx can hide a write that landed (as `add_student` did on every create). `_write_result_verified` therefore treats `5xx` as "no verdict" and lets the read-back decide: found → `✅ Success (verified)` + "do NOT retry"; not found → `❌`; read-back unavailable → `⚠️` "unknown, do not retry blindly". A `4xx` or a `200` + `alert-danger` **is** a verdict (an explicit rejection) and stays a failure regardless of read-back, since a record found then would be a pre-existing one. `write_succeeded` stays strict — a 500 remains a failure for endpoints with no read-back to overrule it — so this belongs in the tools' result handling, never in the generic heuristic. `add_staff` gets the same 5xx-gated read-back via `_find_new_staff_id`; `add_parent` and `link_guardian_to_student` inherit it. `_readback()` wraps every verification read so a broken read can't escape and hide the write's outcome.
-
-**Retries are one-way.** `GET /schools/{id}/students` 404s (POST-only route) and there is no delete route (`POST /schools/{id}/students/{id}` with `_method=delete` → 404), so a duplicate student — or anything created by probe work — can only be removed through the website.
-
-### The student edit form lies about class enrollment
-`<select name="student[section_ids][]">` on `/schools/{id}/students/{sid}/edit` is server-rendered with the grade's available classes but **never marks any option `selected`**, and `data-initval` is always `"[]"` — the current enrollment is fetched separately by JS. Scraping it therefore returns `[]` for every student, and echoing that back as `student[section_ids][]=""` makes Rails **unenroll the student from every class**. This shipped as a live data-loss bug in `edit_student` (fixed: `extract_student_edit_fields` no longer reads the field, and `build_edit_student_body` **omits** the key unless a caller passes an explicit list). General rule, same as `kids_attributes` on parent PATCHes: **omit any nested/collection key you did not intend to change** — Rails treats present-but-empty as "clear it".
-
-### `get_json`'s Accept header must stay JSON-only`PSClient.get_json()` sends `Accept: application/json`. Widening it to the browser's `application/json, text/javascript, */*; q=0.01` **breaks the Rails roster feeds** (`/schools/{id}/roster/parents_data`, `students_data`, `staff_data`): `respond_to` then picks the JS format, which has no template, and the request 404s — silently taking down `list_parents` / `list_students` / `list_staff`. The `/api/v2/` endpoints are happy either way.
-
-### Schools Without ICS Calendars
-Some schools don't use the ICS calendar feature. Instead, monthly calendars are posted as **image attachments** in feed posts (e.g. weekly update posts). When `get_calendar_events` returns empty, Claude should:
-1. Browse feeds looking for posts with calendar-like attachment names or body text mentioning "calendar"
-2. Open those posts to view the inline calendar images
-3. Read the calendar image content to answer date questions
-
-### Feed Text: Expanded vs Truncated
-ParentSquare renders both a truncated and expanded (full) version of each post's text in the feed HTML. The expanded version is hidden via `display: none` CSS. The feed parser prefers the expanded version, giving Claude full post text without extra HTTP requests. This is critical — key phrases like "review the attached calendar" or "February Break" are often past the truncation boundary.
+**The rule behind most of these:** match the real form's submission param-for-param, and **omit
+any nested/collection key you did not intend to change** — Rails distinguishes *missing* from
+*present-but-empty*, and treats present-but-empty as "clear it".
 
 ## Development
 
@@ -208,6 +188,48 @@ Before the first CI-driven release, add a "pending" trusted publisher on pypi.or
    - Publishes to PyPI via OIDC
    - Publishes to the MCP Registry via `mcp-publisher login github-oidc`
    - Creates a GitHub Release with auto-generated notes and the built artifacts
+
+### Watching the run: this repo is a fork
+
+`jasonko/psquare-mcp` is a fork of `thehesiod/psquare-mcp`, so **bare `gh run` / `gh release`
+commands resolve to the upstream parent** and silently report on the wrong repository:
+`gh run list` returns stale upstream runs (making a failed release look like it never
+triggered) and `gh run view <id>` 404s against `thehesiod/...`. Always pass the repo
+explicitly:
+
+```bash
+gh run list --workflow=publish.yml -R jasonko/psquare-mcp
+gh run view <run-id> -R jasonko/psquare-mcp --log-failed
+gh api repos/jasonko/psquare-mcp/actions/runs --jq '.workflow_runs[0] | "\(.head_branch) \(.status) \(.conclusion)"'
+```
+
+Verify the outcome at the source rather than trusting the job list — PyPI
+(`curl -s -o /dev/null -w '%{http_code}' https://pypi.org/pypi/psquare-mcp/X.Y.Z/json`) and the
+registry (`https://registry.modelcontextprotocol.io/v0/servers?search=io.github.jasonko/psquare`).
+
+### If a release fails before PyPI accepts the upload
+
+The version number is only burned once PyPI has the artifact (a PyPI 404 for `X.Y.Z` means it is
+still free). If the upload never landed, prefer deleting the tag and its GitHub Release and
+re-tagging the fix commit over bumping to a throwaway patch version:
+
+```bash
+gh release delete X.Y.Z -R jasonko/psquare-mcp --yes --cleanup-tag
+git tag -d X.Y.Z && git push origin :refs/tags/X.Y.Z
+git tag X.Y.Z && git push origin main --tags
+```
+
+### Keep the publish action's pin current with the build metadata version
+
+`publish.yml` pins `pypa/gh-action-pypi-publish` to an exact version, and that pin has to keep
+pace with the **core metadata version hatchling emits** — the action's bundled `twine` rejects any
+metadata version it predates, *before* making a network request. This broke the 0.3.0 release:
+hatchling 1.32.0 (2026-08-11) bumped the default to `Metadata-Version: 2.5` per PEP 794, and the
+pinned action v1.14.0 ships twine 6.1.0, which failed with
+`InvalidDistribution: '2.5' is not a valid metadata version`. Fixed by moving to v1.14.2
+(twine 7.0.0). **PyPI itself already accepted 2.5** — the failure is purely client-side, so the
+fix is to bump the action (or, as a stopgap, `with: verify-metadata: false`), never to pin
+hatchling backwards.
 
 ### Ownership proof for the MCP Registry
 
